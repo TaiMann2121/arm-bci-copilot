@@ -258,13 +258,15 @@ def normalTargetSoftmax(env,arg):
     # choose correct direction using angle, magnitude normal noise
     optimalDir = (targetPos - cursorPos)
     optimalAngle = np.arctan2(optimalDir[1],optimalDir[0])
-    lessOptimalAngle = (optimalAngle + np.random.normal(0, np.pi/3))
+    # angular noise: π/3 → 0.761
+    lessOptimalAngle = (optimalAngle + np.random.normal(0, 0.761))
     lessOptimalAngle = (lessOptimalAngle + np.pi) % (2 * np.pi) - np.pi # wrap
     selectedMag = np.random.normal(0.5, 0.1) # mean,var
     chosenDirection2 = np.array([np.cos(lessOptimalAngle),np.sin(lessOptimalAngle)]) * selectedMag
   
-    # choose duration
-    chosenDirectionTimer = np.random.randint(15,30)
+    # direction hold timer: calibrate to your median 0.625s onset
+    # At 50Hz, 0.625s = ~31 ticks. Using range around that:
+    chosenDirectionTimer = np.random.randint(25, 40)
     transitionTimerLength = np.random.randint(10,15)
     transitionTimer = 0
 
@@ -276,8 +278,8 @@ def normalTargetSoftmax(env,arg):
   else:
     vel = chosenDirection2
 
-  # add noise to the velocity at the end
-  vel += np.random.normal(0, 0.03, 2)
+  # additive Gaussian noise: 0.03 → 0.113
+  vel += np.random.normal(0, 0.113, 2)
 
   # convert vel to softmax
   softmax = np.zeros(5)
