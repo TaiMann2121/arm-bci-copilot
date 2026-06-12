@@ -1,0 +1,4 @@
+SJtools/copilot/runs/LAB_dataDriven_*/
+SJtools/copilot/runs/lab_training/LAB_dataDriven_*/
+__pycache__/
+*.pyc
