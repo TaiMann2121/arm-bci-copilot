@@ -475,7 +475,7 @@ class SJ4DirectionsEnv(gym.Env):
     print()
 
     # initialize result
-    self.result = [np.array([0,0]),np.array([np.NAN,np.NAN]),-1,0]  # [cursorPos, targetPos, state_taskidx, success]
+    self.result = [np.array([0,0]),np.array([np.nan,np.nan]),-1,0]  # [cursorPos, targetPos, state_taskidx, success]
 
     # initialize trial results
     self.trialResults = [] # should only count trials with actual targets
@@ -547,20 +547,44 @@ class SJ4DirectionsEnv(gym.Env):
       [cursorPos, targetPos, targetSize, state_taskidx, game_state, detail] = arg
       if self._surrogate is None:
           return normalTargetSoftmax(env, arg)
-      vel = self._surrogate.get_velocity()
       
-      # Use real direction but normalTargetSoftmax-compatible magnitude
-      speed = np.sqrt(vel[0]**2 + vel[1]**2)
-      if speed > 1e-6:
-          # Get direction from real data
-          direction = vel / speed
-          # Use magnitude from normalTargetSoftmax range (mean 0.5, some noise)
-          magnitude = np.random.normal(0.5, 0.1)
-          magnitude = max(0.1, magnitude)
-          vel = direction * magnitude
+      is_outer_trial = (
+          game_state.islower() and
+          not np.isnan(targetPos[0]) and
+          np.linalg.norm(targetPos) > 0.1
+      )
+      
+      #if self.isEval:  # only print for eval env to avoid spam
+          #print(f"[EVAL] game_state={game_state} targetPos={targetPos} cursorPos={cursorPos} is_outer={is_outer_trial} surrogate_step={self._surrogate._step}")
+      if self.isEval and not game_state.islower():
+          print(f"[EVAL TRIAL END] game_state={game_state} cursorPos={cursorPos} targetPos={targetPos} dist={np.linalg.norm(targetPos - cursorPos):.3f}")
+      if is_outer_trial:
+        vel = self._surrogate.get_velocity()
+        speed = np.sqrt(vel[0]**2 + vel[1]**2)
+        
+        # Direction toward target from current position
+        to_target = targetPos - cursorPos
+        to_target_dist = np.linalg.norm(to_target)
+        
+        if to_target_dist > 1e-6 and speed > 1e-6:
+            # Use real data direction blended with target direction
+            real_direction = vel / speed
+            target_direction = to_target / to_target_dist
+            # Blend: 0.5 real data (noise/realism), 0.5 target direction
+            direction = 0.5 * real_direction + 0.5 * target_direction
+            direction = direction / np.linalg.norm(direction)
+            
+            remaining_ticks = max(1, 16 - self._surrogate._step)
+            magnitude = to_target_dist / (0.09375 * remaining_ticks)
+            magnitude = np.clip(magnitude, 0.1, 2.0)
+            vel = direction * magnitude
+        else:
+            vel = np.zeros(2)
       else:
-          # Zero velocity — keep as zero (cursor not moving, realistic)
-          vel = np.zeros(2)
+        vel = np.zeros(2)
+      
+      #if self.isEval:
+          #print(f"[EVAL] vel={vel}")
       
       softmax = np.zeros(N_STATE)
       softmax[1] = max(float(vel[0]), 0.0)
@@ -636,7 +660,11 @@ class SJ4DirectionsEnv(gym.Env):
     return obs, reward, done, False, {"target_pos":self.result[1],"task_id":self.result[3],"softmax":softmax,"cursor_pos":self.result[0],"result":self.result}
 
   def reset(self, seed=None, options=None):
-    
+    # Force surrogate reset at every episode boundary so eval env
+    # doesn't replay a stale/exhausted trajectory
+    if self._surrogate is not None and self.softmax_type == 'data_driven':
+        import random
+        self._surrogate.reset(random.randint(0, 7))
     skipped = False
     while True:
       if self.taskGame.activeTrialHasBegun: # result[3] != -1: #state_taskidx  
@@ -657,7 +685,6 @@ class SJ4DirectionsEnv(gym.Env):
               (-1.000,  0.000): 7,  # w
           }
           # find closest matching label
-          import numpy as np
           lbl = None
           best_dist = float('inf')
           for pos, l in _pos2label.items():
@@ -665,6 +692,7 @@ class SJ4DirectionsEnv(gym.Env):
               if d < best_dist:
                   best_dist, lbl = d, l
           if best_dist < 0.1:  # only reset if we actually matched a target
+              #] target_pos={target_pos} matched label={lbl} best_dist={best_dist:.4f}")
               self._surrogate.reset(lbl)
         # get softmax and obs
         softmax = self.softmax

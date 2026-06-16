@@ -200,7 +200,7 @@ myFiles.log(fullCommand)
 
 """ ============== CREATE RL ENV ============== """
 from SJtools.copilot.env import init_lab_surrogate
-init_lab_surrogate("D:\BCI Typing Paradigm and Decoding Problem\Copilot\Training Data\online_arm_trajectories.csv")
+init_lab_surrogate("SJtools/copilot/Training Data/online_arm_trajectories.csv")
 env = SJ4DirectionsEnv(wandbUsed=wandbUsed,render=args.renderTrain,showSoftmax=args.showSoftmax,showVelocity=args.showVelocity,showHeatmap=args.showHeatmap,softmax_type=args.softmax_type,reward_type=args.reward_type,setAlpha=args.alpha,CSvalue=args.CS,stillCS=args.stillCS,useTargetPredictor=args.target_predictor,target_predictor_input=args.target_predictor_input,cursor_target_obs=args.cursor_target_obs,holdtime=args.holdtime,curriculum_yaml=args.curriculum_yaml,extra_targets=args.extra_targets,extra_targets_yaml=args.extra_targets_yaml,obs=args.obs,action=args.action,historyDim=args.history,historyReset=args.historyReset,maskSoftmax=args.maskSoftmax,binaryAlpha=args.binaryAlpha,obs_heatmap=args.obs_heatmap,obs_heatmap_option=args.obs_heatmap_option,center_out_back=args.center_out_back,velReplaceSoftmax=args.velReplaceSoftmax,cardinalVelocityThres=args.cardinalVelocityThres,noSoftmax=args.noSoftmax,tools=args.tools,trial_per_episode=args.trial_per_episode,hideMass=not args.showMass,action_param=args.action_param)
 eval_env = SJ4DirectionsEnv(isEval=True,wandbUsed=wandbUsed,render=args.renderEval,showSoftmax=args.showSoftmax,showVelocity=args.showVelocity,showHeatmap=args.showHeatmap,softmax_type=args.softmax_type,reward_type=args.reward_type,setAlpha=args.alpha,CSvalue=args.CS,stillCS=args.stillCS,target_predictor_input=args.target_predictor_input,useTargetPredictor=args.target_predictor,cursor_target_obs=args.cursor_target_obs,holdtime=args.holdtime,curriculum_yaml=args.curriculum_yaml,extra_targets=args.extra_targets,extra_targets_yaml=args.extra_targets_yaml,obs=args.obs,action=args.action,historyDim=args.history,historyReset=args.historyReset,maskSoftmax=args.maskSoftmax,binaryAlpha=args.binaryAlpha,obs_heatmap=args.obs_heatmap,obs_heatmap_option=args.obs_heatmap_option,center_out_back=args.center_out_back,velReplaceSoftmax=args.velReplaceSoftmax,cardinalVelocityThres=args.cardinalVelocityThres,noSoftmax=args.noSoftmax,tools=args.tools,trial_per_episode=args.trial_per_episode,hideMass=not args.showMass,action_param=args.action_param)
 env = Monitor(env) # this monitor wrapping is necessary in sb3
@@ -222,8 +222,11 @@ policy_kwargs = {'net_arch':net_arch}
 if args.model == "RecurrentPPO":
     model = RecurrentPPO(policy, env, n_steps=args.n_steps, learning_rate=learing_rate, batch_size=args.batch_size ,verbose=1, tensorboard_log=myFiles.tensorboard_log, device=args.device)
 if args.model == "PPO":
-    model = PPO(policy, env, n_steps=args.n_steps, learning_rate=learing_rate, batch_size=args.batch_size, verbose=1, tensorboard_log=myFiles.tensorboard_log, policy_kwargs=policy_kwargs, device=args.device)
-
+    model = PPO(policy, env, n_steps=args.n_steps, learning_rate=learing_rate, 
+                batch_size=args.batch_size, verbose=1, 
+                tensorboard_log=myFiles.tensorboard_log, 
+                policy_kwargs=policy_kwargs, device=args.device,
+                ent_coef=0.01)  # ← add this
 """ save model yaml """
 yamlcontent = {
         "copilot":{
@@ -267,8 +270,8 @@ data2log = {}
 finalLog = "" # for run.py
 if not args.save: models_text.pop(); models.pop() # best model is not saved
 for model,txt in zip(models,models_text):
-    for softmax_type in ["normal_target"]:
-    # for softmax_type in [args.softmax_type]:
+    #for softmax_type in ["normal_target"]:
+    for softmax_type in [args.softmax_type]:
 
         total_trials = 100
         trial_i = 0
