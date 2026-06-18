@@ -6,18 +6,27 @@ instead of the parametric surrogate.
 
 Identical to the Method 1 training pipeline EXCEPT:
   - wraps both env and eval_env with RealDataWrapper
-  - uses reward_type='baseLinAngle.yaml' (angle-based reward)
+  - reward is terminal-only binary (+1/-1) matching angle_pred metric
   - softmax_type='normal_target' (used as a dummy; overwritten by wrapper)
 
 Run from arm-bci-copilot/ :
 
     # Quick 40k-step diagnostic run
-    python train_method2.py -timesteps 40000 -log_interval 1 -no_wandb -dev -fileName diag_realData_run1
+    python train_method2.py -timesteps 40000 -log_interval 1 -no_wandb -dev -fileName diag_realData_run4
 
     # Full training run (overnight)
-    python train_method2.py -timesteps 1200000 -no_wandb -fileName LAB_realData_run1
+    python train_method2.py -timesteps 1200000 -no_wandb -fileName LAB_realData_run4
 
 All other train.py arguments work as normal.
+
+Run history:
+  Run1: wrong reward (movement-direction) → N/S overfitting
+  Run2: terminal_scale=10 → extreme actions, std 1.0→4.3
+  Run3: terminal_scale=2.0, ent_coef=0.01 → std grew monotonically 1.0→3.36,
+        full eval 46.3% vs 46.7% baseline (no improvement)
+  Run4: terminal-only binary reward (+1/-1), ent_coef=0.0
+        → value fn never learned (EV≈0), callback mean 47.8%, full eval 46.8% (+0.1pp)
+  Run5: position-based delta_cos*3.0 + terminal*0.1, ent_coef=0.0
 """
 
 import sys
@@ -181,8 +190,7 @@ model = PPO(
     tensorboard_log = myFiles.tensorboard_log,
     policy_kwargs = {'net_arch': net_arch},
     device        = args.device,
-    ent_coef      = 0.01,   # keep at 0.01 for fast learning; AngleAccuracyCallback
-                             # saves the best model before any late entropy collapse
+    ent_coef      = 0.0,   # no entropy bonus
 )
 
 # ── save model yaml ───────────────────────────────────────────────────────────

@@ -267,12 +267,15 @@ class AngleAccuracyCallback(BaseCallback):
                 s, n = per_dir[lbl]
                 print(f"  {DIR_NAMES[lbl]}: {s}/{n} ({s/n*100:.0f}%)")
 
-        # Save if improved
+        # Save if improved (model_save_path is None when running with -dev flag)
         if acc > self._best_acc:
             self._best_acc = acc
-            save_path = os.path.join(self.model_save_path, 'best_model')
-            self.model.save(save_path)
-            if self.verbose >= 1:
-                print(f"  ✓ New best! Saved to {save_path}.zip")
+            if self.model_save_path is not None:
+                save_path = os.path.join(self.model_save_path, 'best_model')
+                self.model.save(save_path)
+                if self.verbose >= 1:
+                    print(f"  ✓ New best! Saved to {save_path}.zip")
+            elif self.verbose >= 1:
+                print(f"  ✓ New best! (save disabled in dev mode)")
 
         return True

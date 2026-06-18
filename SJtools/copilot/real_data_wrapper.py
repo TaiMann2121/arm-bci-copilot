@@ -284,17 +284,29 @@ class RealDataWrapper(gym.Wrapper):
 
     def _angular_reward(self, info: dict, is_terminal: bool) -> float:
         """
-        Compute position-based angular reward.
+        Position-based angular reward (Run 5).
 
-        Per tick:   delta_cos = cos(cursor_to_target_angle)_now - cos(...)_prev
-        At terminal: additional bonus = final cos score (scaled modestly)
+        Reward is based solely on the angle between the cursor POSITION vector
+        and the target direction — not on the velocity vector. This correctly
+        handles the case where the cursor moves radially (toward/away from
+        origin) along the target axis: angle unchanged → delta_cos = 0 → no
+        reward or penalty, which is the right behaviour.
 
-        Terminal scale of 2.0 (was 10.0) prevents the policy from learning
-        extreme chargeTargets outputs just to maximise the large terminal bonus,
-        which caused action std to blow up from 1.0 → 4.3 over 1.2M steps.
+        Per tick:
+            delta_cos = cos(cursor_angle_to_target)_now - cos(...)_prev
+            reward    = delta_cos * 3.0
 
-        The cos score is dot(cursor_unit, target_unit_direction).
-        At origin (cursor = 0), cos is undefined -> reward = 0.
+        At terminal:
+            reward    = delta_cos * 3.0 + final_cos * 0.1
+
+        Scale of 3.0 keeps per-episode reward in the ±2 range (learnable by
+        the value function). Terminal bonus of 0.1 * final_cos provides a small
+        anchor to the outcome without dominating the per-tick signal (Run 2's
+        terminal_scale=10 and Run 3's terminal_scale=2 both caused instability;
+        0.1 keeps the terminal contribution subordinate).
+
+        Center trials (target_dir is None) return 0.0 — they have no
+        meaningful target direction and should not contribute gradient noise.
         """
         if self._target_dir is None:
             return 0.0
@@ -315,10 +327,9 @@ class RealDataWrapper(gym.Wrapper):
         self._prev_cos = current_cos
 
         if is_terminal:
-            # Terminal bonus scaled to 2× (not 10×) to keep action std near 1.0
-            return delta + current_cos * 2.0
+            return delta * 3.0 + current_cos * 0.1
 
-        return delta * 5.0
+        return delta * 3.0
 
     def _inject(self, tick: int):
         """Write the real softmax into env.softmax."""

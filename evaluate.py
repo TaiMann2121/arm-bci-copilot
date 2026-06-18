@@ -1,7 +1,7 @@
 """
-evaluate_method1_optionB.py
+evaluate.py
 ============================
-Evaluates the Method 1 copilot (LAB_CS0.75_verify2/best_model.zip) on real
+Evaluates the copilot on real
 lab trajectory data from online_arm_trajectories.csv.
 
 KEY DIFFERENCE FROM evaluate_method1_on_real_data.py
@@ -51,7 +51,7 @@ from stable_baselines3 import PPO
 
 # ── paths ─────────────────────────────────────────────────────────────────────
 CSV_PATH   = "SJtools/copilot/Training Data/online_arm_trajectories.csv"
-MODEL_PATH = "SJtools/copilot/runs/LAB_realData_run3/best_model.zip"
+MODEL_PATH = "SJtools/copilot/runs/LAB_realData_run5/best_model.zip"
 
 # ── constants ─────────────────────────────────────────────────────────────────
 RADIUS_PX   = 432.0
@@ -293,7 +293,7 @@ def simulate_copilot_trial(model, trial: dict,
 # ── main evaluation ───────────────────────────────────────────────────────────
 def run_evaluation():
     print("=" * 65)
-    print("Method 1 Copilot Evaluation — Option B (angle-based metric)")
+    print("Copilot Evaluation angle-based metric")
     print("=" * 65)
     print(f"Model : {MODEL_PATH}")
     print(f"Data  : {CSV_PATH}")
