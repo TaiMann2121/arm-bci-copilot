@@ -21,85 +21,56 @@ This wrapper intercepts step() and reset():
     5. Sets env.softmax to tick 0 of the real sequence.
 
   step(action):
-    1. Sets env.softmax to the current real tick velocity.
-       (The env will read this immediately at line 632.)
-    2. Calls inner env.step(action).
-    3. Advances tick counter; sets env.softmax to the NEXT tick velocity
-       so it's ready for the observation that SB3 will read.
+    1. Records the cursor position BEFORE env.step() for counterfactual reward.
+    2. Sets env.softmax to the current real tick velocity.
+    3. Calls inner env.step(action).
+    4. Computes counterfactual reward (see REWARD below).
+    5. Advances tick counter; sets env.softmax to the NEXT tick velocity.
 
 The inner env must be created with:
   - velReplaceSoftmax=True   (so obs encodes velocity, not raw softmax)
   - softmax_type='normal_target'  (getSoftmax fallback; overwritten each tick)
   - center_out_back=True
-  - action=['chargeTargets']
+  - action=['chargeTargets']      (env init only; action space overridden below)
+  - The wrapper overrides the gym action_space to Box(2,) so SB3 outputs (vx,vy).
+  - The wrapper maintains its own cursor independently of the env's VXY cursor,
+    applying: cursor += real_vel + clip(action, -1, 1) * COPILOT_VEL
 
-REWARD
-------
-Pass reward_type='baseLinAngle.yaml'.  This rewards angular progress toward
-the target at each tick, which is exactly your lab's classification metric.
-It works correctly regardless of whether the cursor reaches radius 1.0.
+REWARD — Counterfactual baseline (Run6)
+---------------------------------------
+reward = [cos(cursor_with_copilot, target) - cos(cursor_without_copilot, target)] * 3.0
 
-USAGE IN train.py
------------------
-  from SJtools.copilot.real_data_wrapper import RealDataWrapper
+The counterfactual cursor is computed as:
+  cursor_without = prev_cursor + real_vel   (BCI only, no copilot)
 
-  env = SJ4DirectionsEnv(
-      velReplaceSoftmax=True,
-      softmax_type='normal_target',
-      reward_type='baseLinAngle.yaml',
-      action=['chargeTargets'],
-      action_param=['temperature', '1'],
-      historyDim=[5, 20, 'pos'],
-      historyReset='last',
-      extra_targets_yaml='lab_dir8.yaml',
-      center_out_back=True,
-      holdtime=0.5,
-      obs=[],
-      CSvalue=0.75,   # unused at runtime, needed for env init
-      stillCS=0.0,
-  )
-  env = RealDataWrapper(env, csv_path='SJtools/copilot/Training Data/online_arm_trajectories.csv')
-  env = Monitor(env)
+This decorrelates the copilot reward from the BCI decoder's accuracy on each
+direction. Previously the model received more total reward on N trials simply
+because the BCI baseline accuracy is higher for N (60.2%) than NE (41.6%),
+creating a learning bias. The counterfactual reward measures only what the
+copilot contributed on top of the BCI signal, giving equal learning opportunity
+across all 8 directions regardless of BCI accuracy.
 
-Then train exactly as before:
-  model = PPO('MlpPolicy', env, ...)
-  model.learn(total_timesteps=1_200_000, ...)
-
-TRAINING COMMAND (equivalent to Method 1 run, but with real data)
------------------------------------------------------------------
-  python train.py \\
-      -model PPO \\
-      -timesteps 1200000 \\
-      -softmax_type normal_target \\
-      -reward_type baseLinAngle.yaml \\
-      -action chargeTargets \\
-      -action_param temperature 1 \\
-      -history 5 20 pos \\
-      -historyReset last \\
-      -extra_targets_yaml lab_dir8.yaml \\
-      -center_out_back \\
-      -velReplaceSoftmax \\
-      -CS 0.75 \\
-      -stillCS 0.0 \\
-      -holdtime 0.5 \\
-      -lr 0.0003 \\
-      -n_steps 2048 \\
-      -batch_size 64 \\
-      -log_interval 4 \\
-      -no_wandb \\
-      -fileName LAB_realData_run1 \\
-      -use_real_data    ← new flag added to train.py (see below)
+ACTION — Direct velocity output (Run6)
+---------------------------------------
+The copilot outputs (vx, vy) in [-1, 1], scaled by COPILOT_VEL=0.02.
+This replaces the chargeTargets Coulomb mechanism which was position-dependent:
+the same action produced different physical forces depending on cursor position,
+creating a feedback loop that amplified directional drift. Direct velocity output
+is position-independent: the same action always produces the same cursor
+displacement, giving the policy a clean gradient.
 """
 
 import numpy as np
 import pandas as pd
 import gymnasium as gym
+from gymnasium import spaces
 from collections import defaultdict
 
 
 # ── constants (must match env and CSV) ───────────────────────────────────────
-RADIUS_PX = 432.0
-N_STATE   = 5
+RADIUS_PX   = 432.0
+N_STATE     = 5
+COPILOT_VEL = 0.02  # copilot velocity scale (matches evaluate.py)
 
 TARGET_NAME_TO_LABEL = {
     'nw': 0, 'n': 1, 'ne': 2, 'e': 3,
@@ -158,10 +129,22 @@ class RealDataWrapper(gym.Wrapper):
         self._rng = np.random.default_rng(rng_seed)
         self._traj_library = self._load_csv(csv_path)
 
+        # Override action space: SB3 should output (vx, vy) shape (2,)
+        # The env's chargeTargets action space is shape (9,) which we don't want.
+        self.action_space = spaces.Box(
+            low=-1.0, high=1.0, shape=(2,), dtype=np.float32
+        )
+
         # Runtime state
-        self._vel_seq      = []
+        self._vel_seq      = []          # softmax sequences for env injection
+        self._raw_vel_seq  = np.zeros((0, 2), dtype=np.float32)  # raw (vx,vy)
         self._tick         = 0
         self._zero_softmax = np.zeros(N_STATE, dtype=np.float32)
+        self._prev_cursor  = np.zeros(2, dtype=np.float32)  # for counterfactual
+
+        # Independent cursor tracked by wrapper (separate from env's VXY cursor)
+        # Rewards are computed from this cursor, not inner.result[0].
+        self._cursor         = np.zeros(2, dtype=np.float32)
 
         # Per-trial angular reward state
         self._prev_cos     = 0.0   # cos(angle) at previous tick
@@ -187,7 +170,7 @@ class RealDataWrapper(gym.Wrapper):
             vy   = np.diff(cy)
             if len(vx) == 0:
                 continue
-            library[lbl].append(np.stack([vx, vy], axis=1))  # (T, 2)
+            library[lbl].append(np.stack([vx, vy], axis=1))  # (T, 2) raw (vx,vy)
 
         counts = {k: len(v) for k, v in library.items()}
         print(f"[RealDataWrapper] Trajectories per label: {counts}")
@@ -197,15 +180,21 @@ class RealDataWrapper(gym.Wrapper):
     # ── trial sampling ────────────────────────────────────────────────────────
 
     def _sample_trial(self, target_label: int):
-        """Sample a random real trajectory for the given label."""
+        """Sample a random real trajectory for the given label.
+
+        Returns (softmax_seq, raw_vel_seq):
+          softmax_seq : list of np.ndarray(5,) — encoded for env.softmax injection
+          raw_vel_seq : np.ndarray (T, 2)      — raw (vx, vy) for counterfactual reward
+        """
         trajs = self._traj_library.get(target_label)
         if not trajs:
             # Fallback: sample from any label (should never happen with lab_dir8)
             all_trajs = [t for ts in self._traj_library.values() for t in ts]
             trajs = all_trajs
         idx = self._rng.integers(len(trajs))
-        seq = trajs[idx]   # (T, 2)
-        return [_vel_to_softmax(seq[i, 0], seq[i, 1]) for i in range(len(seq))]
+        seq = trajs[idx]   # (T, 2) raw (vx, vy)
+        softmax_seq = [_vel_to_softmax(seq[i, 0], seq[i, 1]) for i in range(len(seq))]
+        return softmax_seq, seq   # seq is already np.ndarray (T, 2)
 
     def _get_softmax_for_tick(self, tick: int) -> np.ndarray:
         if tick < len(self._vel_seq):
@@ -252,26 +241,39 @@ class RealDataWrapper(gym.Wrapper):
         # Reset angular reward state
         self._prev_cos = 0.0
 
-        # Sample matching real trajectory
-        self._vel_seq = self._sample_trial(lbl)
-        self._tick    = 0
+        # Sample matching real trajectory (returns softmax seq + raw vel seq)
+        self._vel_seq, self._raw_vel_seq = self._sample_trial(lbl)
+        self._tick        = 0
+        self._prev_cursor = np.zeros(2, dtype=np.float32)
+        self._cursor      = np.zeros(2, dtype=np.float32)
         self._inject(0)
 
         return obs, info
 
     def step(self, action):
+        # Save wrapper cursor BEFORE update (for counterfactual: BCI-only position)
+        self._prev_cursor = self._cursor.copy()
+
+        # Get raw BCI velocity for this tick
+        raw_vel = self._get_raw_vel_for_tick(self._tick)
+
         # Inject current tick before env reads self.softmax
         self._inject(self._tick)
 
-        obs, reward, done, truncated, info = self.env.step(action)
+        # Pass a dummy action to the env (env uses chargeTargets for init only;
+        # its internal cursor is not used for rewards — we track our own).
+        # We pass zeros shaped for chargeTargets (9,) so the env doesn't crash.
+        dummy_action = np.zeros(9, dtype=np.float32)
+        obs, _env_reward, done, truncated, info = self.env.step(dummy_action)
 
-        # Override reward with position-based angular improvement.
-        # This replaces the noisy movement-direction reward from baseLinAngle.yaml
-        # with a signal directly aligned with the arm_prediction_label metric:
-        #   reward_t = cos(cursor_angle_to_target)_t - cos(cursor_angle_to_target)_{t-1}
-        # This is symmetric across all 8 directions and has much lower variance
-        # than per-tick movement-direction rewards.
-        reward = self._angular_reward(info, done or truncated)
+        # Update wrapper's independent cursor:
+        #   cursor += real_vel + clip(cop_dir, -1, 1) * COPILOT_VEL
+        cop_dir = np.clip(action, -1.0, 1.0).astype(np.float32)
+        self._cursor = self._cursor + raw_vel + cop_dir * COPILOT_VEL
+        self._cursor = np.clip(self._cursor, -1.5, 1.5)
+
+        # Counterfactual reward based on wrapper's cursor, not env's cursor
+        reward = self._counterfactual_reward(raw_vel, done or truncated)
 
         self._tick += 1
         self._inject(self._tick)
@@ -279,57 +281,68 @@ class RealDataWrapper(gym.Wrapper):
         if done or truncated:
             self._tick = 0
             self._prev_cos = 0.0
+            self._prev_cursor = np.zeros(2, dtype=np.float32)
+            self._cursor      = np.zeros(2, dtype=np.float32)
 
         return obs, reward, done, truncated, info
 
-    def _angular_reward(self, info: dict, is_terminal: bool) -> float:
-        """
-        Position-based angular reward (Run 5).
+    def _get_raw_vel_for_tick(self, tick: int) -> np.ndarray:
+        """Return raw (vx, vy) for the given tick, or zeros if past end."""
+        if tick < len(self._raw_vel_seq):
+            return self._raw_vel_seq[tick].astype(np.float32)
+        return np.zeros(2, dtype=np.float32)
 
-        Reward is based solely on the angle between the cursor POSITION vector
-        and the target direction — not on the velocity vector. This correctly
-        handles the case where the cursor moves radially (toward/away from
-        origin) along the target axis: angle unchanged → delta_cos = 0 → no
-        reward or penalty, which is the right behaviour.
+    def _cos_to_target(self, cursor: np.ndarray) -> float:
+        """cos(angle between cursor position vector and target direction)."""
+        norm = np.linalg.norm(cursor)
+        if norm < 1e-6:
+            return 0.0
+        return float(np.dot(cursor / norm, self._target_dir))
+
+    def _counterfactual_reward(self, raw_vel: np.ndarray,
+                                is_terminal: bool) -> float:
+        """
+        Counterfactual reward: measures only the copilot's angular contribution.
 
         Per tick:
-            delta_cos = cos(cursor_angle_to_target)_now - cos(...)_prev
-            reward    = delta_cos * 3.0
+            cursor_with    = self._cursor              (BCI + copilot, wrapper-tracked)
+            cursor_without = self._prev_cursor + raw_vel  (BCI only, counterfactual)
+            reward = (cos_with - cos_without) * 3.0
 
         At terminal:
-            reward    = delta_cos * 3.0 + final_cos * 0.1
+            reward += cos_with * 0.1                  (small outcome anchor)
 
-        Scale of 3.0 keeps per-episode reward in the ±2 range (learnable by
-        the value function). Terminal bonus of 0.1 * final_cos provides a small
-        anchor to the outcome without dominating the per-tick signal (Run 2's
-        terminal_scale=10 and Run 3's terminal_scale=2 both caused instability;
-        0.1 keeps the terminal contribution subordinate).
+        Uses the wrapper's independently tracked cursor (self._cursor), NOT the
+        env's internal cursor (inner.result[0]). The env uses chargeTargets
+        internally for initialization, but its cursor position is not meaningful
+        for our task. The wrapper applies: cursor += real_vel + cop_dir * 0.02.
 
-        Center trials (target_dir is None) return 0.0 — they have no
-        meaningful target direction and should not contribute gradient noise.
+        WHY COUNTERFACTUAL:
+        Decorrelates the copilot reward from the BCI decoder's per-direction
+        accuracy. Previously N trials generated more reward than NE simply
+        because BCI baseline is higher for N (60.2%) vs NE (41.6%), biasing
+        the policy. The counterfactual measures only what the copilot added.
+
+        Center trials (target_dir is None) return 0.0 — no meaningful target.
         """
         if self._target_dir is None:
             return 0.0
 
-        result = info.get('result', None)
-        if result is None:
-            return 0.0
+        # Cursor with copilot (wrapper-tracked, already updated in step())
+        cursor_with = self._cursor
 
-        cursor_pos = result[0]
-        cursor_norm = np.linalg.norm(cursor_pos)
+        # Counterfactual: BCI only, no copilot
+        cursor_without = self._prev_cursor + raw_vel
 
-        if cursor_norm < 1e-6:
-            self._prev_cos = 0.0
-            return 0.0
+        cos_with    = self._cos_to_target(cursor_with)
+        cos_without = self._cos_to_target(cursor_without)
 
-        current_cos = float(np.dot(cursor_pos / cursor_norm, self._target_dir))
-        delta = current_cos - self._prev_cos
-        self._prev_cos = current_cos
+        reward = (cos_with - cos_without) * 3.0
 
         if is_terminal:
-            return delta * 3.0 + current_cos * 0.1
+            reward += cos_with * 0.1
 
-        return delta * 3.0
+        return reward
 
     def _inject(self, tick: int):
         """Write the real softmax into env.softmax."""

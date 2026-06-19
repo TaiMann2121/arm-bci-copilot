@@ -14,9 +14,8 @@ equation (13) from Lee et al.:
 where:
   - real_decoder_vel[t]  = (vx, vy) from the CSV at tick t  (already in
                            normalised [-1,1] space, radius = 432 px)
-  - copilot_vel[t]       = calc_copilot_charge_vel(copilot_output, cursor[t])
-                           using the same chargeTargets formula as training,
-                           scaled by copilotVel = 0.02
+  - copilot_vel[t]       = copilot_output[t] * COPILOT_VEL
+                           direct (vx, vy) scaled by 0.02 (Run6+)
 
 SUCCESS METRIC
 --------------
@@ -46,7 +45,6 @@ import sys
 import os
 import numpy as np
 import pandas as pd
-import torch
 from stable_baselines3 import PPO
 
 # ── paths ─────────────────────────────────────────────────────────────────────
@@ -55,13 +53,9 @@ MODEL_PATH = "SJtools/copilot/runs/LAB_realData_run5/best_model.zip"
 
 # ── constants ─────────────────────────────────────────────────────────────────
 RADIUS_PX   = 432.0
-COPILOT_VEL = 0.02   # matches kf_4_directions_constructor.py default
+COPILOT_VEL = 0.02   # copilot velocity scale (matches training)
 N_HIST      = 5      # history length (from best_model.yaml: history [5, 20, pos])
 HIST_INTV   = 20     # history interval (ticks)
-EPS         = 0.01   # chargeTargets epsilon
-K           = 1.0    # chargeTargets K
-POWER       = 2.0    # chargeTargets distance power
-TEMPERATURE = 1.0    # from best_model.yaml action_param temperature: '1'
 
 # 8 target unit-direction vectors, indexed by label 0–7
 # (from lab_dir8.yaml, normalised)
@@ -78,19 +72,7 @@ LABEL_TO_DIR = np.array([
 
 LABEL_NAMES = ['NW', 'N', 'NE', 'E', 'SE', 'S', 'SW', 'W']
 
-# Target positions sorted by (x, y) — this is how TaskCopilotAction.updateTargetPos
-# orders them, which determines which index in the copilot output maps to which target.
-#
-# IMPORTANT: the env includes a 'center' target at (0,0) in addition to the 8
-# directional targets from lab_dir8.yaml.  updateTargetPos filters by isinstance(pos,
-# np.ndarray) which keeps 'center' and removes only 'still' (a string).  After sorting,
-# center lands at index 4.  The trained model therefore has action_dim = 9.
-_dir_targets = LABEL_TO_DIR.tolist()
-_all_targets  = _dir_targets + [[0.0, 0.0]]   # add center
-TARGETS_SORTED = np.array(sorted(_all_targets, key=lambda p: (p[0], p[1])),
-                           dtype=np.float32)
-# action dim inferred from training
-ACTION_DIM = len(TARGETS_SORTED)  # 9
+# Run6+: action space is direct (vx, vy) — no target sorting needed.
 
 
 # ── angle-based prediction ────────────────────────────────────────────────────
@@ -106,29 +88,23 @@ def angle_pred(cursor: np.ndarray) -> int:
     return int(np.argmax(LABEL_TO_DIR @ (cursor / norm)))
 
 
-# ── chargeTargets copilot velocity ───────────────────────────────────────────
+# ── direct velocity copilot (Run6+) ─────────────────────────────────────────
 def calc_copilot_vel(copilot_output: np.ndarray, cursor_pos: np.ndarray) -> np.ndarray:
     """
-    Reproduce CTarget.calc_copilot_charge_vel exactly.
+    Apply copilot action as direct (vx, vy) velocity.
 
-    copilot_output: shape (9,), raw PPO output in [-1, 1] (8 dirs + center)
-    cursor_pos:     shape (2,), current cursor in normalised space
+    copilot_output: shape (2,), raw PPO output in [-1, 1]
+    cursor_pos:     shape (2,), unused — kept for API compatibility
     Returns:        shape (2,), velocity in normalised space
+
+    Run6+ uses direct velocity output instead of chargeTargets.
+    The policy outputs (vx, vy) in [-1, 1]; we scale by COPILOT_VEL=0.02.
+    This is position-independent: the same action always produces the same
+    cursor displacement regardless of where the cursor is.
     """
-    # Rescale from [-1,1] to [0,1]  (useClip=False, so no clipping)
-    charges = (copilot_output + 1.0) / 2.0
-
-    # Softmax with temperature=1
-    charges = charges / TEMPERATURE
-    charges = torch.softmax(torch.tensor(charges, dtype=torch.float32), dim=0).numpy()
-
-    # Coulomb-style charge field
-    diffs = TARGETS_SORTED - cursor_pos          # shape (9, 2)
-    dists = np.linalg.norm(diffs, axis=1)        # shape (9,)
-    mag   = K * charges / (dists ** POWER + EPS) # shape (9,)
-    charge_vel = mag @ diffs                     # shape (2,)
-
-    return charge_vel * COPILOT_VEL
+    vx = float(np.clip(copilot_output[0], -1.0, 1.0))
+    vy = float(np.clip(copilot_output[1], -1.0, 1.0))
+    return np.array([vx, vy], dtype=np.float32) * COPILOT_VEL
 
 
 # ── observation builder ───────────────────────────────────────────────────────

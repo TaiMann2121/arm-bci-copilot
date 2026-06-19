@@ -39,10 +39,7 @@ N_STATE     = 5
 N_HIST      = 5
 HIST_INTV   = 20
 COPILOT_VEL = 0.02
-EPS         = 0.01
-K           = 1.0
-POWER       = 2.0
-TEMPERATURE = 1.0
+# EPS, K, POWER, TEMPERATURE removed — no longer needed (Run6+ uses direct velocity)
 
 DIR_NAMES = ['NW', 'N', 'NE', 'E', 'SE', 'S', 'SW', 'W']
 
@@ -57,12 +54,7 @@ LABEL_TO_DIR = np.array([
     [-1.000,  0.000],
 ], dtype=np.float32)
 
-# Targets sorted by (x, y) — matches CTarget.updateTargetPos order
-# Includes center at (0,0), giving action_dim = 9
-_all_targets = LABEL_TO_DIR.tolist() + [[0.0, 0.0]]
-TARGETS_SORTED = np.array(
-    sorted(_all_targets, key=lambda p: (p[0], p[1])), dtype=np.float32
-)
+# TARGETS_SORTED removed — no longer needed (Run6+ uses direct velocity output)
 
 
 # ── helper functions (self-contained, no env needed) ──────────────────────────
@@ -86,15 +78,11 @@ def _angle_pred(cursor):
     return int(np.argmax(LABEL_TO_DIR @ (cursor / norm)))
 
 def _calc_copilot_vel(copilot_output, cursor_pos):
-    import torch
-    charges = (copilot_output + 1.0) / 2.0
-    charges = torch.softmax(
-        torch.tensor(charges / TEMPERATURE, dtype=torch.float32), dim=0
-    ).numpy()
-    diffs = TARGETS_SORTED - cursor_pos
-    dists = np.linalg.norm(diffs, axis=1)
-    mag   = K * charges / (dists ** POWER + EPS)
-    return (mag @ diffs) * COPILOT_VEL
+    # Run6+: direct (vx, vy) output — position-independent.
+    # cursor_pos kept for API compatibility but unused.
+    vx = float(np.clip(copilot_output[0], -1.0, 1.0))
+    vy = float(np.clip(copilot_output[1], -1.0, 1.0))
+    return np.array([vx, vy], dtype=np.float32) * COPILOT_VEL
 
 
 class _HistQueue:

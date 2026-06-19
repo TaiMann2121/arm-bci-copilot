@@ -12,10 +12,10 @@ Identical to the Method 1 training pipeline EXCEPT:
 Run from arm-bci-copilot/ :
 
     # Quick 40k-step diagnostic run
-    python train_method2.py -timesteps 40000 -log_interval 1 -no_wandb -dev -fileName diag_realData_run4
+    python train_method2.py -timesteps 40000 -log_interval 1 -no_wandb -dev -fileName diag_realData_run6
 
     # Full training run (overnight)
-    python train_method2.py -timesteps 1200000 -no_wandb -fileName LAB_realData_run4
+    python train_method2.py -timesteps 1200000 -no_wandb -fileName LAB_realData_run6
 
 All other train.py arguments work as normal.
 
@@ -27,6 +27,8 @@ Run history:
   Run4: terminal-only binary reward (+1/-1), ent_coef=0.0
         → value fn never learned (EV≈0), callback mean 47.8%, full eval 46.8% (+0.1pp)
   Run5: position-based delta_cos*3.0 + terminal*0.1, ent_coef=0.0
+        → EV rose to 0.35-0.48, full eval 47.4% (+0.7pp); NE/E/W hurt by Coulomb bias
+  Run6: direct (vx,vy) output + counterfactual reward, ent_coef=0.0
 """
 
 import sys
@@ -65,7 +67,7 @@ parser.add_argument("-csv_path",       type=str,
 parser.add_argument("-rng_seed",       type=int,   default=None)
 
 # Fixed Method 2 hyperparameters (not exposed as flags — these are locked in)
-# action=['chargeTargets'], history=[5,20,pos], reward=baseLinAngle.yaml
+# action=['chargeTargets'] (env init only; wrapper overrides to (vx,vy))
 
 fullCommand = "python train_method2.py " + " ".join(sys.argv[1:])
 args = parser.parse_args()
@@ -108,8 +110,8 @@ myFiles.log(fullCommand)
 ENV_KWARGS = dict(
     softmax_type      = 'normal_target',  # dummy; overwritten by wrapper each tick
     reward_type       = 'baseLinAngle.yaml',
-    action            = ['chargeTargets'],
-    action_param      = ['temperature', '1'],
+    action            = ['chargeTargets'],  # env init only; RealDataWrapper overrides
+    action_param      = ['temperature', '1'],  # needed for env init
     historyDim        = [5, 20, 'pos'],
     historyReset      = 'last',
     extra_targets_yaml= 'lab_dir8.yaml',
@@ -190,7 +192,7 @@ model = PPO(
     tensorboard_log = myFiles.tensorboard_log,
     policy_kwargs = {'net_arch': net_arch},
     device        = args.device,
-    ent_coef      = 0.0,   # no entropy bonus
+    ent_coef      = 0.0,   # no entropy bonus — keeps std stable (confirmed Run4/5)
 )
 
 # ── save model yaml ───────────────────────────────────────────────────────────
