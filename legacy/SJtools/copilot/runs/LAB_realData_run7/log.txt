@@ -1,0 +1,1 @@
+python train_method2.py -timesteps 1200000 -no_wandb -fileName LAB_realData_run7

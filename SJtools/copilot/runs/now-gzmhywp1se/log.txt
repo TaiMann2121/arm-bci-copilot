@@ -1,1 +1,0 @@
-python -m SJtools.copilot.train -timesteps 50000 -no_wandb -extra_targets_yaml dir-8.yaml

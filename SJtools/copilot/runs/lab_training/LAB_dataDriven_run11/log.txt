@@ -1,6 +1,0 @@
-python -m SJtools.copilot.train -model PPO -holdtime 0.125 -stillCS 0.0 -timesteps 1200000 -lr_scheduler constant -n_steps 2048 -batch_size 512 -softmax_type data_driven -CS 0.75 -velReplaceSoftmax -no_wandb -reward_type baseLinDist.yaml -center_out_back -history 5 20 pos -historyReset last -extra_targets_yaml lab_dir8.yaml -policy_param_p 64 64 64 -policy_param_v 64 64 64 -filePath ./SJtools/copilot/runs/lab_training/ -fileName LAB_dataDriven_run11
-last model with normal_target softmax: 0.5, 50, 100
-^ time to hit, avg extra distance travelled, avg distance travelled: 269.01, 0.19, 0.71
-best model with normal_target softmax: 0.5, 50, 100
-^ time to hit, avg extra distance travelled, avg distance travelled: 265.97, 0.17, 0.69
-python -m SJtools.copilot.train -model PPO -holdtime 0.125 -stillCS 0.0 -timesteps 1200000 -lr_scheduler constant -n_steps 2048 -batch_size 512 -softmax_type data_driven -CS 0.75 -velReplaceSoftmax -no_wandb -reward_type baseLinDist.yaml -center_out_back -history 5 20 pos -historyReset last -extra_targets_yaml lab_dir8.yaml -policy_param_p 64 64 64 -policy_param_v 64 64 64 -filePath ./SJtools/copilot/runs/lab_training/ -fileName LAB_dataDriven_run11
