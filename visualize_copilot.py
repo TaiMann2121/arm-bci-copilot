@@ -1,8 +1,6 @@
 """
-visualize_copilot_v3.py
+visualize_copilot.py
 =======================
-V3: Updated to use the supervised LSTM copilot (best_model.pt from
-supervised_copilot_v3/) instead of the RL chargeTargets model (Run5).
 
 The LSTM copilot uses:
   - Input per tick: (cursor_x, cursor_y, vx_unit, vy_unit, vel_mag_scaled)
@@ -13,7 +11,7 @@ The LSTM copilot uses:
 Overall result: BCI 46.70% → Copilot 47.77% (+1.07pp, all 7 subjects)
 
 Run from arm-bci-copilot/:
-    python visualize_copilot_v3.py
+    python visualize_copilot.py
 
 Output: copilot_visualization.html  (~8MB, self-contained, works offline)
 """
@@ -82,7 +80,7 @@ def angle_pred(cursor):
 
 
 class LSTMCopilot(nn.Module):
-    """Two-layer LSTM target classifier — matches train_supervised_copilot_v3.py."""
+    """Two-layer LSTM target classifier — matches train_supervised_copilot.py."""
     def __init__(self):
         super().__init__()
         self.lstm       = nn.LSTM(INPUT_SIZE, HIDDEN_SIZE, N_LAYERS,
@@ -491,7 +489,7 @@ def build_figure(results):
     ))
     annotations.append(dict(
         xref='paper', yref='paper', x=0.5, y=0.974,
-        text=(f'Supervised LSTM Copilot V3 · '
+        text=(f'Supervised LSTM Copilot · '
               f'Data: online_arm_trajectories.csv · '
               f'Overall: BCI 46.7% → Copilot 47.8% (+1.07pp) · '
               f'1,470 trials per direction'),
@@ -710,7 +708,7 @@ def save_html(main_fig, results):
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>BCI Copilot Visualization V2</title>
+<title>BCI Copilot Visualization</title>
 <style>
   body {{ font-family: 'Segoe UI', Arial, sans-serif; background: #F8FAFC;
           margin: 0; padding: 20px; color: #1e293b; }}
@@ -734,7 +732,7 @@ def save_html(main_fig, results):
 </head>
 <body>
 <h1>BCI Copilot — Cursor Trajectory Visualization</h1>
-<h2>Supervised LSTM Copilot V3 &nbsp;·&nbsp;
+<h2>Supervised LSTM Copilot &nbsp;·&nbsp;
     Data: online_arm_trajectories.csv &nbsp;·&nbsp;
     Overall: BCI 46.7% → Copilot 47.8% (+1.07pp)</h2>
 
@@ -771,13 +769,13 @@ def save_html(main_fig, results):
 
 def main():
     print("=" * 60)
-    print("BCI Copilot Visualization V3 — Supervised LSTM")
+    print("BCI Copilot Visualization — Supervised LSTM")
     print("=" * 60)
     print(f"Model : {MODEL_PATH}")
     print(f"Data  : {CSV_PATH}")
     print()
 
-    print("Loading supervised LSTM copilot (V3)...")
+    print("Loading supervised LSTM copilot ...")
     model = LSTMCopilot()
     model.load_state_dict(torch.load(MODEL_PATH, map_location='cpu'))
     model.eval()
