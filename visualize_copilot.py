@@ -1,6 +1,9 @@
 """
 visualize_copilot.py
 =======================
+V4: Redesigned visualization — removes mean trajectory overview,
+replaces with compact accuracy summary table and a richer trajectory
+explorer with 4 outcome categories per direction.
 
 The LSTM copilot uses:
   - Input per tick: (cursor_x, cursor_y, vx_unit, vy_unit, vel_mag_scaled)
@@ -13,7 +16,7 @@ Overall result: BCI 46.70% → Copilot 47.77% (+1.07pp, all 7 subjects)
 Run from arm-bci-copilot/:
     python visualize_copilot.py
 
-Output: copilot_visualization.html  (~8MB, self-contained, works offline)
+Output: copilot_visualization.html  (self-contained, works offline)
 """
 
 import numpy as np
@@ -22,7 +25,6 @@ import torch
 import random
 import json
 import torch.nn as nn
-import plotly.graph_objects as go
 
 # ── paths ──────────────────────────────────────────────────────────────────────
 CSV_PATH    = "data/online_arm_trajectories.csv"
@@ -37,7 +39,7 @@ HIDDEN_SIZE  = 64
 N_LAYERS     = 2
 VEL_MAG_MEAN = 0.0424
 VEL_MAG_STD  = 0.0262
-N_SAMPLE     = 20
+N_SAMPLE     = 20   # trials per category per direction embedded in HTML
 RANDOM_SEED  = 42
 
 LABEL_TO_DIR = np.array([
@@ -47,26 +49,48 @@ LABEL_TO_DIR = np.array([
 ], dtype=np.float32)
 LABEL_NAMES = ['NW', 'N', 'NE', 'E', 'SE', 'S', 'SW', 'W']
 
-# Keyboard clusters for each direction (from the lab typing paradigm)
+# Primary keyboard cluster for each direction
 KEYBOARD = {
-    0: 'W/Q · E · R',    # NW
-    1: 'T · Y · U',       # N
-    2: 'I · O · P',       # NE
-    3: 'F · G · H/J',     # E
-    4: 'M · K · L',       # SE
-    5: 'B · N',           # S
-    6: 'Z/X · C · V',     # SW
-    7: 'A · S · D',       # W
+    0: 'W/Q · E · R',
+    1: 'T · Y · U',
+    2: 'I · O · P',
+    3: 'F · G · H/J',
+    4: 'M · K · L',
+    5: 'B · N',
+    6: 'Z/X · C · V',
+    7: 'A · S · D',
 }
 
-# Compass grid positions (row, col) in a 3×3 grid with center empty
-GRID_POS = {0:(0,0), 1:(0,1), 2:(0,2), 3:(1,2), 4:(2,2), 5:(2,1), 6:(2,0), 7:(1,0)}
+# 4 outcome categories
+CATEGORIES = {
+    'correction': {'label': '✓ Copilot corrects',  'color': '#16a34a',
+                   'desc': 'BCI wrong → Copilot correct'},
+    'failure':    {'label': '✗ Copilot fails',      'color': '#dc2626',
+                   'desc': 'BCI correct → Copilot wrong'},
+    'both_fail':  {'label': '✗ Both wrong',          'color': '#9333ea',
+                   'desc': 'BCI wrong → Copilot wrong'},
+    'both_ok':    {'label': '✓ Both correct',        'color': '#2563EB',
+                   'desc': 'BCI correct → Copilot correct'},
+}
+CAT_ORDER = ['correction', 'failure', 'both_fail', 'both_ok']
 
 
-# ── simulation helpers ─────────────────────────────────────────────────────────
+# ── model ──────────────────────────────────────────────────────────────────────
+
+class LSTMCopilot(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.lstm       = nn.LSTM(INPUT_SIZE, HIDDEN_SIZE, N_LAYERS,
+                                  batch_first=True, dropout=0.2)
+        self.classifier = nn.Linear(HIDDEN_SIZE, 8)
+    def forward(self, x):
+        out, _ = self.lstm(x)
+        return self.classifier(out)
+
+
+# ── helpers ────────────────────────────────────────────────────────────────────
 
 def normalize_vel(vx, vy):
-    """Returns (vx_unit, vy_unit, vel_mag_scaled) — matches training."""
     mag = np.sqrt(vx**2 + vy**2)
     mag_scaled = (mag - VEL_MAG_MEAN) / (VEL_MAG_STD + 1e-8)
     if mag > 1e-6:
@@ -78,17 +102,15 @@ def angle_pred(cursor):
     if n < 1e-6: return -1
     return int(np.argmax(LABEL_TO_DIR @ (cursor/n)))
 
+def dir_deg(v):
+    return float(np.degrees(np.arctan2(v[1], v[0])))
 
-class LSTMCopilot(nn.Module):
-    """Two-layer LSTM target classifier — matches train_supervised_copilot.py."""
-    def __init__(self):
-        super().__init__()
-        self.lstm       = nn.LSTM(INPUT_SIZE, HIDDEN_SIZE, N_LAYERS,
-                                  batch_first=True, dropout=0.2)
-        self.classifier = nn.Linear(HIDDEN_SIZE, 8)
-    def forward(self, x):
-        out, _ = self.lstm(x)
-        return self.classifier(out)
+def wedge_points(center_deg, half_deg=22.5, r=RADIUS_PX, n=40):
+    angs = np.linspace(np.radians(center_deg-half_deg),
+                       np.radians(center_deg+half_deg), n)
+    xs = np.concatenate([[0], r*np.cos(angs), [0]])
+    ys = np.concatenate([[0], r*np.sin(angs), [0]])
+    return xs.tolist(), ys.tolist()
 
 
 # ── data loading ───────────────────────────────────────────────────────────────
@@ -96,23 +118,22 @@ class LSTMCopilot(nn.Module):
 def load_trials(csv_path):
     print("Loading CSV...")
     df = pd.read_csv(csv_path)
-    gcols = ['subject_id','session_number','run_number','trial_number','inner_trial_number']
+    gcols = ['subject_id','session_number','run_number',
+             'trial_number','inner_trial_number']
     by_dir  = {i:[] for i in range(8)}
     by_subj = {}
-    for key, grp in df.groupby(gcols):
-        grp = grp.sort_values('timestamp_seconds').reset_index(drop=True)
-        lbl = int(grp['target_label'].iloc[0])
+    for _, grp in df.groupby(gcols):
+        grp  = grp.sort_values('timestamp_seconds').reset_index(drop=True)
+        lbl  = int(grp['target_label'].iloc[0])
         if lbl not in range(8): continue
         subj = grp['subject_id'].iloc[0]
         cx = grp['cursor_pos_x'].values.astype(np.float32) / RADIUS_PX
         cy = grp['cursor_pos_y'].values.astype(np.float32) / RADIUS_PX
         vx = np.diff(cx); vy = np.diff(cy)
         if len(vx) == 0: continue
-        t = {
-            'subject_id': subj, 'target_label': lbl,
-            'vel_seq':    list(zip(vx.tolist(), vy.tolist())),
-            'cursor_seq': list(zip(cx.tolist(), cy.tolist())),
-        }
+        t = {'subject_id': subj, 'target_label': lbl,
+             'vel_seq': list(zip(vx.tolist(), vy.tolist())),
+             'cursor_seq': list(zip(cx.tolist(), cy.tolist()))}
         by_dir[lbl].append(t)
         by_subj.setdefault(subj, []).append(t)
     for lbl in range(8):
@@ -120,640 +141,736 @@ def load_trials(csv_path):
     return by_dir, by_subj
 
 
-# ── trajectory computation ─────────────────────────────────────────────────────
+# ── trajectory simulation ──────────────────────────────────────────────────────
 
 def sim_bci(trial):
-    """BCI-only trajectory starting from (0,0). Returns (T+1,2) normalized."""
     cursor = np.zeros(2, dtype=np.float32)
     path   = [cursor.copy()]
     for vx, vy in trial['vel_seq']:
-        cursor = np.clip(cursor + np.array([vx, vy], dtype=np.float32), -1.5, 1.5)
+        cursor = np.clip(cursor + np.array([vx,vy], dtype=np.float32), -1.5, 1.5)
         path.append(cursor.copy())
     return np.array(path)
 
 @torch.no_grad()
-def sim_copilot(model, trial, hq_unused, prev_unused):
-    """
-    BCI+Copilot trajectory using the supervised LSTM copilot.
-    hq_unused and prev_unused kept for API compatibility with compute_all().
-    Returns (T+1,2) normalized.
-    """
+def sim_copilot(model, trial):
     model.eval()
     cursor = np.zeros(2, dtype=np.float32)
     path   = [cursor.copy()]
     h, c   = None, None
-
     for vx, vy in trial['vel_seq']:
         nvx, nvy, vmag = normalize_vel(vx, vy)
         x_t = torch.tensor(
             np.array([[[cursor[0], cursor[1], nvx, nvy, vmag]]]),
-            dtype=torch.float32
-        )
+            dtype=torch.float32)
         if h is None:
             lstm_out, (h, c) = model.lstm(x_t)
         else:
             lstm_out, (h, c) = model.lstm(x_t, (h, c))
-
         logits_t   = model.classifier(lstm_out[:, -1, :])
         conf       = float(torch.softmax(logits_t, dim=-1).max().item())
         pred_t     = int(logits_t.argmax().item())
         correction = LABEL_TO_DIR[pred_t] * COPILOT_VEL * conf
-        bci_vel    = np.array([vx, vy], dtype=np.float32)
-        cursor     = np.clip(cursor + bci_vel + correction, -1.5, 1.5)
+        cursor     = np.clip(cursor + np.array([vx,vy],dtype=np.float32)
+                             + correction, -1.5, 1.5)
         path.append(cursor.copy())
-
     return np.array(path)
+
+
+# ── main computation ───────────────────────────────────────────────────────────
 
 def compute_all(model, by_dir, by_subj):
     """
-    Compute mean BCI and Copilot trajectories per direction.
-    Copilot evaluation matches evaluate.py: cross-trial history per subject.
-    Returns dict with trajectories and trial-level outcome data.
+    Simulate copilot on all trials (subject order for cross-trial consistency).
+    Returns per-direction accuracy stats and 4-category trial samples.
     """
-    hq = None  # unused by LSTM copilot (kept for API compatibility)
+    rng = random.Random(RANDOM_SEED)
 
-    # Run copilot on all trials in subject order (matches evaluate_supervised_copilot.py)
-    cop_outcomes = {}  # trial_id -> (bci_correct, cop_correct, bci_path, cop_path, lbl)
-    print("Simulating copilot (subject order, matching evaluate.py)...")
+    # Step 1: simulate all trials in subject order
+    outcomes = {}  # id(trial) -> (bci_ok, cop_ok, bci_path, cop_path)
+    print("Simulating copilot (subject order)...")
     for subj in sorted(by_subj.keys()):
-        prev = np.zeros(2, dtype=np.float32)
         for trial in by_subj[subj]:
-            lbl  = trial['target_label']
             bci_path = sim_bci(trial)
-            cop_path = sim_copilot(model, trial, hq, prev)
-            prev = cop_path[-1].copy()
-            bci_ok = angle_pred(bci_path[-1]) == lbl
-            cop_ok = angle_pred(cop_path[-1]) == lbl
-            tid = id(trial)
-            cop_outcomes[tid] = (bci_ok, cop_ok, bci_path, cop_path, lbl)
+            cop_path = sim_copilot(model, trial)
+            bci_ok   = angle_pred(bci_path[-1]) == trial['target_label']
+            cop_ok   = angle_pred(cop_path[-1]) == trial['target_label']
+            outcomes[id(trial)] = (bci_ok, cop_ok, bci_path, cop_path)
         print(f"  {subj} done")
 
-    # Aggregate per direction
-    rng = random.Random(RANDOM_SEED)
+    # Step 2: per-direction stats and category buckets
     results = {}
     for lbl in range(8):
-        trials = by_dir[lbl]
-        # BCI paths (independent, no history needed)
-        bci_paths = [sim_bci(t) for t in trials]
-        cop_paths = [cop_outcomes[id(t)][3] for t in trials]
-        bci_oks   = [cop_outcomes[id(t)][0] for t in trials]
-        cop_oks   = [cop_outcomes[id(t)][1] for t in trials]
+        trials   = by_dir[lbl]
+        bci_oks  = [outcomes[id(t)][0] for t in trials]
+        cop_oks  = [outcomes[id(t)][1] for t in trials]
+        bci_acc  = sum(bci_oks) / len(bci_oks)
+        cop_acc  = sum(cop_oks) / len(cop_oks)
 
-        # Pad to same length
-        max_len = max(len(p) for p in bci_paths)
-        def pad(paths):
-            out = []
-            for p in paths:
-                if len(p) < max_len:
-                    p = np.concatenate([p, np.repeat(p[-1:], max_len-len(p), axis=0)])
-                out.append(p)
-            return np.stack(out)
+        # Bucket all trials into 4 categories
+        buckets = {'correction':[], 'failure':[], 'both_fail':[], 'both_ok':[]}
+        for i, t in enumerate(trials):
+            bci_ok, cop_ok, bci_path, cop_path = outcomes[id(t)]
+            entry = {
+                'bci': (bci_path * RADIUS_PX).tolist(),
+                'cop': (cop_path * RADIUS_PX).tolist(),
+                'bci_pred': LABEL_NAMES[angle_pred(bci_path[-1])],
+                'cop_pred': LABEL_NAMES[angle_pred(cop_path[-1])],
+            }
+            if not bci_ok and cop_ok:
+                buckets['correction'].append(entry)
+            elif bci_ok and not cop_ok:
+                buckets['failure'].append(entry)
+            elif not bci_ok and not cop_ok:
+                buckets['both_fail'].append(entry)
+            else:
+                buckets['both_ok'].append(entry)
 
-        bci_arr = pad(bci_paths); cop_arr = pad(cop_paths)
-        mean_bci = bci_arr.mean(0); mean_cop = cop_arr.mean(0)
+        # Sample N_SAMPLE from each bucket (shuffle for variety)
+        sampled = {}
+        for cat, entries in buckets.items():
+            rng.shuffle(entries)
+            sampled[cat] = entries[:N_SAMPLE]
 
-        # Sample individual BCI traces
-        idx = rng.sample(range(len(trials)), min(N_SAMPLE, len(trials)))
-        samples = [{'path': bci_paths[i],
-                    'correct': bci_oks[i],
-                    'pred': LABEL_NAMES[angle_pred(bci_paths[i][-1])]} for i in idx]
-
-        # Find best correction example: BCI wrong → Copilot right
-        corrections = [(i, bci_paths[i], cop_paths[i])
-                       for i in range(len(trials)) if not bci_oks[i] and cop_oks[i]]
-        # Find best failure example: BCI right → Copilot wrong
-        failures    = [(i, bci_paths[i], cop_paths[i])
-                       for i in range(len(trials)) if bci_oks[i] and not cop_oks[i]]
-
-        # Pick a correction/failure example near the median trajectory length
-        example = None
-        if corrections:
-            chosen = rng.choice(corrections[:20])
-            example = {'type': 'correction', 'bci': chosen[1], 'cop': chosen[2]}
-        elif failures:
-            chosen = rng.choice(failures[:20])
-            example = {'type': 'failure', 'bci': chosen[1], 'cop': chosen[2]}
-
-        bci_acc = sum(bci_oks)/len(bci_oks)
-        cop_acc = sum(cop_oks)/len(cop_oks)
-        print(f"  {LABEL_NAMES[lbl]}: BCI={bci_acc*100:.1f}% → Copilot={cop_acc*100:.1f}%  "
-              f"({len(corrections)} corrections, {len(failures)} failures)")
+        n_corr = len(buckets['correction'])
+        n_fail = len(buckets['failure'])
+        print(f"  {LABEL_NAMES[lbl]}: BCI={bci_acc*100:.1f}% → "
+              f"Copilot={cop_acc*100:.1f}%  "
+              f"({n_corr} corrections, {n_fail} failures)")
 
         results[lbl] = {
-            'mean_bci': mean_bci, 'mean_cop': mean_cop,
-            'samples': samples, 'example': example,
             'bci_acc': bci_acc, 'cop_acc': cop_acc,
+            'buckets': sampled,
+            'counts':  {cat: len(buckets[cat]) for cat in CAT_ORDER},
         }
+
     return results
 
 
-# ── wedge geometry ─────────────────────────────────────────────────────────────
+# ── accuracy summary table ─────────────────────────────────────────────────────
 
-def wedge_xy(center_deg, half_deg=22.5, r=RADIUS_PX, n=40):
-    angs = np.linspace(np.radians(center_deg-half_deg),
-                       np.radians(center_deg+half_deg), n)
-    xs = np.concatenate([[0], r*np.cos(angs), [0]])
-    ys = np.concatenate([[0], r*np.sin(angs), [0]])
-    return xs*1.0, ys*1.0
+def build_accuracy_table(results):
+    """Compact HTML table showing per-direction accuracy metrics."""
+    rows = []
+    total_bci = sum(r['bci_acc'] for r in results.values()) / 8
+    total_cop = sum(r['cop_acc'] for r in results.values()) / 8
 
-def dir_deg(v): return float(np.degrees(np.arctan2(v[1], v[0])))
-
-
-# ── build figure ───────────────────────────────────────────────────────────────
-
-def build_figure(results):
-    """
-    Build a single go.Figure with 8 subplots in compass arrangement
-    using manual axis domains.
-    """
-    # Panel domains: 3×3 compass grid, center empty
-    PW = 0.285; PH = 0.265; GX = 0.03; GY = 0.07
-    TITLE_H = 0.07  # space reserved for title at top
-
-    def domain(lbl):
-        row, col = GRID_POS[lbl]
-        x0 = col*(PW+GX)
-        x1 = x0 + PW
-        y1 = 1.0 - TITLE_H - row*(PH+GY)
-        y0 = y1 - PH
-        # Clamp to [0,1] — floating point can push bottom row slightly negative
-        x0 = max(0.0, min(1.0, x0)); x1 = max(0.0, min(1.0, x1))
-        y0 = max(0.0, min(1.0, y0)); y1 = max(0.0, min(1.0, y1))
-        return {'x':[x0,x1], 'y':[y0,y1]}
-
-    domains = {lbl: domain(lbl) for lbl in range(8)}
-
-    # Colors
-    C_SAMPLE = 'rgba(148,163,184,0.3)'
-    C_BCI    = '#2563EB'
-    C_COP    = '#EA580C'
-    C_WEDGE  = 'rgba(254,252,232,0.6)'
-    C_WEDGE_L= 'rgba(202,198,150,0.7)'
-    C_TARGET = 'rgba(100,100,100,0.5)'
-    C_CORR   = '#16a34a'   # green for corrections
-    C_FAIL   = '#dc2626'   # red for failures
-
-    fig = go.Figure()
-    shown = set()
-    annotations = []
-    axis_idx = {}  # lbl -> axis number
-
-    AXIS_RANGE = [-RADIUS_PX*0.92, RADIUS_PX*0.92]
-
-    for panel, lbl in enumerate(range(8)):
-        ax_n  = panel + 1
-        ax_s  = str(ax_n) if ax_n > 1 else ''
-        axis_idx[lbl] = ax_s
-        dom   = domains[lbl]
-        xref  = f'x{ax_s}'; yref = f'y{ax_s}'
-        dir_v = LABEL_TO_DIR[lbl]
-        res   = results[lbl]
-
-        # ── Wedge ──────────────────────────────────────────────────────────
-        wx, wy = wedge_xy(dir_deg(dir_v))
-        fig.add_trace(go.Scatter(
-            x=wx, y=wy, fill='toself', fillcolor=C_WEDGE,
-            line=dict(color=C_WEDGE_L, width=1),
-            mode='lines', hoverinfo='skip', showlegend=False,
-            xaxis=xref, yaxis=yref,
-        ))
-
-        # ── All 8 target markers + keyboard labels ──────────────────────
-        for t_lbl in range(8):
-            tx = LABEL_TO_DIR[t_lbl][0] * RADIUS_PX * 0.82
-            ty = LABEL_TO_DIR[t_lbl][1] * RADIUS_PX * 0.82
-            is_target = (t_lbl == lbl)
-            fig.add_trace(go.Scatter(
-                x=[tx], y=[ty], mode='markers+text',
-                marker=dict(
-                    size=10 if is_target else 6,
-                    color=C_COP if is_target else C_TARGET,
-                    symbol='diamond' if is_target else 'circle',
-                    line=dict(color='white', width=1),
-                ),
-                text=[f'<b>{LABEL_NAMES[t_lbl]}</b>' if is_target else LABEL_NAMES[t_lbl]],
-                textposition='top center',
-                textfont=dict(
-                    size=9 if is_target else 7,
-                    color=C_COP if is_target else '#9CA3AF',
-                ),
-                showlegend=False, hoverinfo='skip',
-                xaxis=xref, yaxis=yref,
-            ))
-
-        # ── Keyboard label annotation for target direction ──────────────
-        kx = dir_v[0] * RADIUS_PX * 0.60
-        ky = dir_v[1] * RADIUS_PX * 0.60
-        annotations.append(dict(
-            x=kx, y=ky, xref=xref, yref=yref,
-            text=f'<i>{KEYBOARD[lbl]}</i>',
-            showarrow=False,
-            font=dict(size=7, color='#6B7280'),
-            bgcolor='rgba(255,255,255,0.7)',
-            borderpad=1,
-        ))
-
-        # ── BCI sample traces ──────────────────────────────────────────
-        for s in res['samples']:
-            path = s['path'] * RADIUS_PX
-            show_l = 'BCI samples' not in shown
-            if show_l: shown.add('BCI samples')
-            fig.add_trace(go.Scatter(
-                x=path[:,0], y=path[:,1],
-                mode='lines', line=dict(color=C_SAMPLE, width=1),
-                showlegend=show_l, legendgroup='samples',
-                name='BCI samples',
-                hovertemplate=(
-                    f"<b>BCI sample</b> — {LABEL_NAMES[lbl]} trial<br>"
-                    f"Predicted: {s['pred']}<br>"
-                    f"{'✓ Correct' if s['correct'] else '✗ Incorrect'}"
-                    "<extra></extra>"
-                ),
-                xaxis=xref, yaxis=yref,
-            ))
-
-        # ── Mean BCI ────────────────────────────────────────────────────
-        bci = res['mean_bci'] * RADIUS_PX
-        show_l = 'Mean BCI' not in shown
-        if show_l: shown.add('Mean BCI')
-        fig.add_trace(go.Scatter(
-            x=bci[:,0], y=bci[:,1], mode='lines',
-            line=dict(color=C_BCI, width=2.5),
-            showlegend=show_l, legendgroup='mean_bci', name='Mean BCI',
-            hovertemplate="<b>Mean BCI</b><br>x=%{x:.0f} px<br>y=%{y:.0f} px<extra></extra>",
-            xaxis=xref, yaxis=yref,
-        ))
-        fig.add_trace(go.Scatter(
-            x=[bci[-1,0]], y=[bci[-1,1]], mode='markers',
-            marker=dict(size=11, color=C_BCI, symbol='circle',
-                        line=dict(color='white', width=1.5)),
-            showlegend=False,
-            hovertemplate=(
-                f"<b>BCI mean endpoint</b><br>"
-                f"x=%{{x:.0f}} px, y=%{{y:.0f}} px<br>"
-                f"Accuracy: {res['bci_acc']*100:.1f}%"
-                "<extra></extra>"
-            ),
-            xaxis=xref, yaxis=yref,
-        ))
-
-        # ── Mean BCI+Copilot ────────────────────────────────────────────
-        cop = res['mean_cop'] * RADIUS_PX
-        show_l = 'Mean BCI+Copilot' not in shown
-        if show_l: shown.add('Mean BCI+Copilot')
-        fig.add_trace(go.Scatter(
-            x=cop[:,0], y=cop[:,1], mode='lines',
-            line=dict(color=C_COP, width=2.5),
-            showlegend=show_l, legendgroup='mean_cop', name='Mean BCI+Copilot',
-            hovertemplate="<b>Mean BCI+Copilot</b><br>x=%{x:.0f} px<br>y=%{y:.0f} px<extra></extra>",
-            xaxis=xref, yaxis=yref,
-        ))
-        fig.add_trace(go.Scatter(
-            x=[cop[-1,0]], y=[cop[-1,1]], mode='markers',
-            marker=dict(size=11, color=C_COP, symbol='diamond',
-                        line=dict(color='white', width=1.5)),
-            showlegend=False,
-            hovertemplate=(
-                f"<b>Copilot mean endpoint</b><br>"
-                f"x=%{{x:.0f}} px, y=%{{y:.0f}} px<br>"
-                f"Accuracy: {res['cop_acc']*100:.1f}%"
-                "<extra></extra>"
-            ),
-            xaxis=xref, yaxis=yref,
-        ))
-
-        # ── Origin ──────────────────────────────────────────────────────
-        fig.add_trace(go.Scatter(
-            x=[0], y=[0], mode='markers',
-            marker=dict(size=7, color='#6B7280', symbol='cross'),
-            showlegend=False, hoverinfo='skip',
-            xaxis=xref, yaxis=yref,
-        ))
-
-        # ── Accuracy annotation (single, no duplicate) ──────────────────
-        delta = res['cop_acc'] - res['bci_acc']
+    for lbl in range(8):
+        r     = results[lbl]
+        delta = r['cop_acc'] - r['bci_acc']
         sign  = '+' if delta >= 0 else ''
-        col   = C_CORR if delta >= 0 else C_FAIL
-        # Place at top of panel in paper coords
-        cx_paper = (dom['x'][0] + dom['x'][1]) / 2
-        cy_paper = dom['y'][1] + 0.005
-        annotations.append(dict(
-            xref='paper', yref='paper',
-            x=cx_paper, y=cy_paper,
-            text=(f"<b>{LABEL_NAMES[lbl]}</b>  "
-                  f"BCI {res['bci_acc']*100:.1f}% → "
-                  f"Copilot {res['cop_acc']*100:.1f}%  "
-                  f"<span style='color:{col}'><b>{sign}{delta*100:.1f}pp</b></span>"),
-            showarrow=False,
-            font=dict(size=9, family='monospace'),
-            align='center',
-            bgcolor='rgba(255,255,255,0.88)',
-            bordercolor='rgba(180,180,180,0.5)',
-            borderwidth=1, borderpad=3,
-        ))
+        dcol  = '#16a34a' if delta >= 0 else '#dc2626'
+        counts = r['counts']
+        rows.append(f"""
+        <tr>
+          <td class="dir-cell">
+            <span class="dir-badge-sm">{LABEL_NAMES[lbl]}</span>
+            <span class="key-sm">{KEYBOARD[lbl]}</span>
+          </td>
+          <td class="num">{r['bci_acc']*100:.1f}%</td>
+          <td class="num">{r['cop_acc']*100:.1f}%</td>
+          <td class="num delta" style="color:{dcol}">{sign}{delta*100:.1f}pp</td>
+          <td class="num cat-count corr">{counts['correction']}</td>
+          <td class="num cat-count fail">{counts['failure']}</td>
+          <td class="num cat-count bfail">{counts['both_fail']}</td>
+          <td class="num cat-count bok">{counts['both_ok']}</td>
+        </tr>""")
 
-        # ── Panel title (direction name) ─────────────────────────────
-        annotations.append(dict(
-            xref='paper', yref='paper',
-            x=cx_paper, y=dom['y'][1] + 0.028,
-            text=f'<b>{LABEL_NAMES[lbl]}</b>',
-            showarrow=False,
-            font=dict(size=12, family='Arial'),
-        ))
+    # Overall row
+    d_all  = total_cop - total_bci
+    s_all  = '+' if d_all >= 0 else ''
+    dc_all = '#16a34a' if d_all >= 0 else '#dc2626'
+    rows.append(f"""
+        <tr class="total-row">
+          <td class="dir-cell"><b>Overall</b></td>
+          <td class="num"><b>{total_bci*100:.1f}%</b></td>
+          <td class="num"><b>{total_cop*100:.1f}%</b></td>
+          <td class="num delta" style="color:{dc_all}"><b>{s_all}{d_all*100:.2f}pp</b></td>
+          <td class="num" colspan="4" style="color:#94a3b8;font-size:11px;">
+            46.70% → 47.77% (+1.07pp, all 7 subjects)
+          </td>
+        </tr>""")
 
-    # ── Axis layout ────────────────────────────────────────────────────────
-    axis_updates = {}
-    for lbl in range(8):
-        ax_s = axis_idx[lbl]
-        dom  = domains[lbl]
-        base_cfg = dict(
-            range=AXIS_RANGE,
-            showgrid=True, gridcolor='rgba(200,200,200,0.4)',
-            zeroline=True, zerolinecolor='rgba(150,150,150,0.5)', zerolinewidth=1,
-            showticklabels=False,
-            constrain='domain',
-            title='',
-        )
-        x_key = f'xaxis{axis_idx[lbl]}'
-        y_key = f'yaxis{axis_idx[lbl]}'
-        axis_updates[x_key] = dict(**base_cfg, domain=domains[lbl]['x'])
-        axis_updates[y_key] = dict(**base_cfg, domain=domains[lbl]['y'],
-                                   scaleanchor=f'x{axis_idx[lbl]}', scaleratio=1)
-
-    # ── Global title ───────────────────────────────────────────────────────
-    annotations.append(dict(
-        xref='paper', yref='paper', x=0.5, y=1.0,
-        text='<b>BCI Copilot — Cursor Trajectory Visualization</b>',
-        showarrow=False, font=dict(size=17, family='Arial'),
-        align='center',
-    ))
-    annotations.append(dict(
-        xref='paper', yref='paper', x=0.5, y=0.974,
-        text=(f'Supervised LSTM Copilot · '
-              f'Data: online_arm_trajectories.csv · '
-              f'Overall: BCI 46.7% → Copilot 47.8% (+1.07pp) · '
-              f'1,470 trials per direction'),
-        showarrow=False, font=dict(size=10, color='#6B7280'),
-        align='center',
-    ))
-
-    fig.update_layout(
-        **axis_updates,
-        annotations=annotations,
-        legend=dict(
-            orientation='h', yanchor='bottom', y=-0.04,
-            xanchor='center', x=0.5,
-            font=dict(size=11),
-            bgcolor='rgba(255,255,255,0.9)',
-            bordercolor='rgba(200,200,200,0.5)', borderwidth=1,
-        ),
-        plot_bgcolor='#F8FAFC',
-        paper_bgcolor='white',
-        height=900, width=1300,
-        margin=dict(t=60, b=60, l=20, r=20),
-        hovermode='closest',
-    )
-
-    return fig
+    return f"""
+<table class="acc-table">
+  <thead>
+    <tr>
+      <th>Direction</th>
+      <th>BCI</th>
+      <th>Copilot</th>
+      <th>Delta</th>
+      <th title="BCI wrong → Copilot correct" class="cat-head corr">✓ Corrected</th>
+      <th title="BCI correct → Copilot wrong" class="cat-head fail">✗ Failed</th>
+      <th title="BCI wrong → Copilot wrong"   class="cat-head bfail">✗ Both fail</th>
+      <th title="BCI correct → Copilot correct" class="cat-head bok">✓ Both ok</th>
+    </tr>
+  </thead>
+  <tbody>
+    {''.join(rows)}
+  </tbody>
+</table>"""
 
 
-# ── correction animation HTML ──────────────────────────────────────────────────
+# ── trajectory explorer ────────────────────────────────────────────────────────
 
-def build_correction_section(results):
+def build_explorer(results):
     """
-    Build a separate section with 8 animated panels (one per direction)
-    showing a real correction example: BCI wrong → Copilot right.
-    Returns an HTML string to embed after the main figure.
+    Interactive trajectory explorer: user picks direction + category,
+    then navigates through up to N_SAMPLE pre-embedded trials.
+    Returns HTML string with embedded JS.
     """
-    sections = []
+    # Embed all sampled trial data as JSON
+    data_by_dir = {}
     for lbl in range(8):
-        res = results[lbl]
-        ex  = res.get('example')
-        name = LABEL_NAMES[lbl]
-        keys = KEYBOARD[lbl]
+        data_by_dir[lbl] = results[lbl]['buckets']
 
-        if ex is None:
-            sections.append(f'<div class="panel"><h3>{name}</h3><p>No example found.</p></div>')
-            continue
+    # Wedge data for each direction
+    wedges = {}
+    for lbl in range(8):
+        wx, wy = wedge_points(dir_deg(LABEL_TO_DIR[lbl]))
+        wedges[lbl] = {'x': wx, 'y': wy}
 
-        bci_path = ex['bci'] * RADIUS_PX   # (T, 2)
-        cop_path = ex['cop'] * RADIUS_PX
-        ex_type  = ex['type']
+    # Target marker positions
+    target_markers = []
+    for t in range(8):
+        target_markers.append({
+            'x': float(LABEL_TO_DIR[t][0] * RADIUS_PX * 0.82),
+            'y': float(LABEL_TO_DIR[t][1] * RADIUS_PX * 0.82),
+            'name': LABEL_NAMES[t],
+        })
 
-        bci_final_pred = LABEL_NAMES[angle_pred(ex['bci'][-1])]
-        cop_final_pred = LABEL_NAMES[angle_pred(ex['cop'][-1])]
-        bci_ok = angle_pred(ex['bci'][-1]) == lbl
-        cop_ok = angle_pred(ex['cop'][-1]) == lbl
+    # Category labels / colors for JS
+    cat_meta = {k: {'label': v['label'], 'color': v['color'], 'desc': v['desc']}
+                for k, v in CATEGORIES.items()}
+    counts_by_dir = {lbl: results[lbl]['counts'] for lbl in range(8)}
+    acc_by_dir    = {lbl: {'bci': results[lbl]['bci_acc'],
+                            'cop': results[lbl]['cop_acc']}
+                     for lbl in range(8)}
 
-        if ex_type == 'correction':
-            headline = f'✓ Copilot corrects a wrong trial'
-            subline  = f'BCI predicted {bci_final_pred} (✗) → Copilot predicted {cop_final_pred} (✓)'
-            h_color  = '#16a34a'
-        else:
-            headline = f'✗ Copilot fails a correct trial'
-            subline  = f'BCI predicted {bci_final_pred} (✓) → Copilot predicted {cop_final_pred} (✗)'
-            h_color  = '#dc2626'
+    data_json    = json.dumps(data_by_dir)
+    wedges_json  = json.dumps(wedges)
+    markers_json = json.dumps(target_markers)
+    catmeta_json = json.dumps(cat_meta)
+    counts_json  = json.dumps(counts_by_dir)
+    acc_json     = json.dumps(acc_by_dir)
+    labels_json  = json.dumps(LABEL_NAMES)
+    keys_json    = json.dumps(KEYBOARD)
+    catorder_json= json.dumps(CAT_ORDER)
+    R            = RADIUS_PX
 
-        T = len(bci_path)
-        wx, wy = wedge_xy(dir_deg(LABEL_TO_DIR[lbl]))
+    return f"""
+<div id="explorer">
 
-        # Build Plotly animation figure for this direction
-        fig_anim = go.Figure()
+  <!-- Controls row -->
+  <div class="ctrl-row">
+    <div class="ctrl-group">
+      <label class="ctrl-label">Direction</label>
+      <div class="btn-group" id="dir-btns">
+        <!-- filled by JS -->
+      </div>
+    </div>
+    <div class="ctrl-group">
+      <label class="ctrl-label">Outcome category</label>
+      <div class="btn-group" id="cat-btns">
+        <!-- filled by JS -->
+      </div>
+    </div>
+    <div class="ctrl-group nav-group">
+      <label class="ctrl-label">Trial</label>
+      <div class="nav-row">
+        <button class="nav-btn" id="btn-prev" onclick="navTrial(-1)">&#8592;</button>
+        <span id="trial-counter" class="trial-counter">1 / 20</span>
+        <button class="nav-btn" id="btn-next" onclick="navTrial(+1)">&#8594;</button>
+        <button class="nav-btn" id="btn-rand" onclick="randTrial()" title="Random trial">&#x21BB;</button>
+      </div>
+    </div>
+  </div>
 
-        # Static: wedge
-        fig_anim.add_trace(go.Scatter(
-            x=wx.tolist(), y=wy.tolist(), fill='toself',
-            fillcolor='rgba(254,252,232,0.6)',
-            line=dict(color='rgba(202,198,150,0.7)', width=1),
-            mode='lines', hoverinfo='skip', showlegend=False,
-        ))
-
-        # Static: target markers for all 8 directions
-        for t_lbl in range(8):
-            tx = LABEL_TO_DIR[t_lbl][0] * RADIUS_PX * 0.82
-            ty = LABEL_TO_DIR[t_lbl][1] * RADIUS_PX * 0.82
-            is_tgt = t_lbl == lbl
-            fig_anim.add_trace(go.Scatter(
-                x=[tx], y=[ty], mode='markers+text',
-                marker=dict(size=9 if is_tgt else 5,
-                            color='#EA580C' if is_tgt else 'rgba(100,100,100,0.4)',
-                            symbol='diamond' if is_tgt else 'circle'),
-                text=[f'<b>{LABEL_NAMES[t_lbl]}</b>' if is_tgt else LABEL_NAMES[t_lbl]],
-                textposition='top center',
-                textfont=dict(size=8 if is_tgt else 6,
-                              color='#EA580C' if is_tgt else '#9CA3AF'),
-                showlegend=False, hoverinfo='skip',
-            ))
-
-        # Origin
-        fig_anim.add_trace(go.Scatter(
-            x=[0], y=[0], mode='markers',
-            marker=dict(size=6, color='#6B7280', symbol='cross'),
-            showlegend=False, hoverinfo='skip',
-        ))
-
-        N_STATIC = len(fig_anim.data)
-
-        # Initial animated traces (tick 0)
-        fig_anim.add_trace(go.Scatter(
-            x=[0], y=[0], mode='lines+markers',
-            line=dict(color='#2563EB', width=2.5),
-            marker=dict(size=8, color='#2563EB'),
-            name='BCI decoder', showlegend=True,
-        ))
-        fig_anim.add_trace(go.Scatter(
-            x=[0], y=[0], mode='lines+markers',
-            line=dict(color='#EA580C', width=2.5, dash='dot'),
-            marker=dict(size=8, color='#EA580C', symbol='diamond'),
-            name='BCI+Copilot', showlegend=True,
-        ))
-
-        # Animation frames (one per tick)
-        frames = []
-        for t in range(1, T+1):
-            frames.append(go.Frame(
-                data=[
-                    go.Scatter(x=bci_path[:t,0].tolist(), y=bci_path[:t,1].tolist(),
-                               mode='lines+markers',
-                               marker=dict(size=[4]*(t-1)+[10], color='#2563EB'),
-                               line=dict(color='#2563EB', width=2.5)),
-                    go.Scatter(x=cop_path[:t,0].tolist(), y=cop_path[:t,1].tolist(),
-                               mode='lines+markers',
-                               marker=dict(size=[4]*(t-1)+[10], color='#EA580C',
-                                           symbol='diamond'),
-                               line=dict(color='#EA580C', width=2.5, dash='dot')),
-                ],
-                traces=[N_STATIC, N_STATIC+1],
-                name=str(t),
-            ))
-        fig_anim.frames = frames
-
-        AXIS_R = [-RADIUS_PX*0.92, RADIUS_PX*0.92]
-        fig_anim.update_layout(
-            xaxis=dict(range=AXIS_R, showticklabels=False, showgrid=True,
-                       gridcolor='rgba(200,200,200,0.4)', zeroline=True,
-                       zerolinecolor='rgba(150,150,150,0.5)',
-                       constrain='domain'),
-            yaxis=dict(range=AXIS_R, showticklabels=False, showgrid=True,
-                       gridcolor='rgba(200,200,200,0.4)', zeroline=True,
-                       zerolinecolor='rgba(150,150,150,0.5)',
-                       scaleanchor='x', scaleratio=1),
-            plot_bgcolor='#F8FAFC', paper_bgcolor='white',
-            height=380, width=380,
-            margin=dict(t=10, b=50, l=10, r=10),
-            legend=dict(orientation='h', y=-0.12, x=0.5, xanchor='center',
-                        font=dict(size=10)),
-            updatemenus=[dict(
-                type='buttons', showactive=False,
-                y=-0.18, x=0.5, xanchor='center',
-                buttons=[
-                    dict(label='▶ Play',
-                         method='animate',
-                         args=[None, dict(frame=dict(duration=200, redraw=True),
-                                          fromcurrent=True, mode='immediate')]),
-                    dict(label='⏸ Pause',
-                         method='animate',
-                         args=[[None], dict(frame=dict(duration=0, redraw=False),
-                                            mode='immediate')]),
-                    dict(label='↺ Reset',
-                         method='animate',
-                         args=[['1'], dict(frame=dict(duration=0, redraw=True),
-                                           mode='immediate')]),
-                ]
-            )],
-            sliders=[dict(
-                steps=[dict(args=[[f.name],
-                                  dict(frame=dict(duration=0, redraw=True),
-                                       mode='immediate')],
-                            label=f.name, method='animate')
-                       for f in fig_anim.frames],
-                x=0.05, len=0.9, y=-0.05,
-                currentvalue=dict(prefix='Tick: ', font=dict(size=10)),
-                pad=dict(t=10),
-            )],
-        )
-
-        anim_html = fig_anim.to_html(
-            include_plotlyjs=False, full_html=False,
-            config={'displayModeBar': False},
-        )
-
-        sections.append(f"""
-        <div class="ex-panel">
-            <div class="ex-header">
-                <span class="dir-badge">{name}</span>
-                <span class="keys">{keys}</span>
-                <span class="headline" style="color:{h_color}">{headline}</span>
-            </div>
-            <div class="subline">{subline}</div>
-            {anim_html}
+  <!-- Main plot + info panel -->
+  <div class="explorer-body">
+    <div id="traj-plot" style="width:520px;height:520px;flex-shrink:0;"></div>
+    <div class="info-panel">
+      <div id="cat-header" class="cat-header-box"></div>
+      <div id="outcome-info" class="outcome-info"></div>
+      <div class="playback-box">
+        <div class="tick-row">
+          <span class="tick-label">Tick:</span>
+          <input type="range" id="tick-slider" min="0" max="16" value="16"
+                 oninput="onSlider(this.value)" style="flex:1;">
+          <span id="tick-val" class="tick-val">16</span>
         </div>
-        """)
+        <div class="play-row">
+          <button class="play-btn" id="btn-play"  onclick="playAnim()">&#9654; Play</button>
+          <button class="play-btn" id="btn-pause" onclick="pauseAnim()" disabled>&#9646;&#9646; Pause</button>
+          <button class="play-btn" id="btn-reset" onclick="resetAnim()">&#8635; Reset</button>
+        </div>
+      </div>
+      <div class="legend-box">
+        <div class="leg-item"><span class="leg-line bci-line"></span>BCI decoder</div>
+        <div class="leg-item"><span class="leg-line cop-line"></span>BCI + Copilot</div>
+      </div>
+      <div id="count-note" class="count-note"></div>
+    </div>
+  </div>
 
-    return '\n'.join(sections)
+</div>
+
+<script>
+(function() {{
+  // ── embedded data ──────────────────────────────────────────────────────────
+  const DATA     = {data_json};
+  const WEDGES   = {wedges_json};
+  const MARKERS  = {markers_json};
+  const CATMETA  = {catmeta_json};
+  const COUNTS   = {counts_json};
+  const ACC      = {acc_json};
+  const LABELS   = {labels_json};
+  const KEYS     = {keys_json};
+  const CATORDER = {catorder_json};
+  const R        = {R};
+
+  // ── state ──────────────────────────────────────────────────────────────────
+  let curDir  = 0;
+  let curCat  = 'correction';
+  let curIdx  = 0;
+  let curTick = 16;
+  let animTimer = null;
+
+  // ── init Plotly ────────────────────────────────────────────────────────────
+  const AXIS_R  = [-R*0.92, R*0.92];
+  const axCfg   = {{
+    range: AXIS_R, showticklabels: false, showgrid: true,
+    gridcolor: 'rgba(200,200,200,0.4)', zeroline: true,
+    zerolinecolor: 'rgba(150,150,150,0.5)', constrain: 'domain',
+    fixedrange: true,
+  }};
+  Plotly.newPlot('traj-plot', [], {{
+    xaxis: axCfg, yaxis: {{...axCfg, scaleanchor:'x', scaleratio:1}},
+    plot_bgcolor:'#F8FAFC', paper_bgcolor:'white',
+    margin: {{t:10,b:10,l:10,r:10}},
+    showlegend: false,
+    height: 520, width: 520,
+  }}, {{displayModeBar:false, responsive:false}});
+
+  // ── build control buttons ──────────────────────────────────────────────────
+  function buildButtons() {{
+    // Direction buttons
+    const db = document.getElementById('dir-btns');
+    db.innerHTML = '';
+    LABELS.forEach((name, lbl) => {{
+      const b = document.createElement('button');
+      b.className = 'sel-btn' + (lbl === curDir ? ' active' : '');
+      b.textContent = name;
+      b.title = KEYS[lbl];
+      b.onclick = () => {{ curDir = lbl; curIdx = 0; curTick = 16; rebuild(); }};
+      db.appendChild(b);
+    }});
+
+    // Category buttons
+    const cb = document.getElementById('cat-btns');
+    cb.innerHTML = '';
+    CATORDER.forEach(cat => {{
+      const n = (DATA[curDir][cat] || []).length;
+      const b = document.createElement('button');
+      b.className = 'sel-btn cat-btn' + (cat === curCat ? ' active' : '');
+      b.style.setProperty('--cat-color', CATMETA[cat].color);
+      b.innerHTML = `${{CATMETA[cat].label}} <span class="cnt">(${{n}})</span>`;
+      b.disabled  = (n === 0);
+      b.onclick   = () => {{
+        if (n === 0) return;
+        curCat = cat; curIdx = 0; curTick = 16; rebuild();
+      }};
+      cb.appendChild(b);
+    }});
+  }}
+
+  // ── update plot ────────────────────────────────────────────────────────────
+  function updatePlot() {{
+    const trials = DATA[curDir][curCat] || [];
+    if (trials.length === 0) return;
+    const trial  = trials[curIdx];
+    const T      = trial.bci.length - 1;  // number of ticks
+    const tick   = Math.min(curTick, T);
+    const bci_s  = trial.bci.slice(0, tick+1);
+    const cop_s  = trial.cop.slice(0, tick+1);
+
+    const wx = WEDGES[curDir].x;
+    const wy = WEDGES[curDir].y;
+    const catColor = CATMETA[curCat].color;
+
+    const traces = [
+      // Wedge
+      {{x: wx, y: wy, fill:'toself', fillcolor:'rgba(254,252,232,0.7)',
+        line:{{color:'rgba(202,198,150,0.8)',width:1}},
+        mode:'lines', hoverinfo:'skip', type:'scatter'}},
+      // Target markers
+      ...MARKERS.map((m,i) => ({{
+        x:[m.x], y:[m.y], mode:'markers+text',
+        marker:{{size: i===curDir?11:6,
+                 color: i===curDir?catColor:'rgba(100,100,100,0.4)',
+                 symbol: i===curDir?'diamond':'circle',
+                 line:{{color:'white',width:1}}}},
+        text:[`<b>${{m.name}}</b>`],
+        textposition:'top center',
+        textfont:{{size: i===curDir?10:7,
+                   color: i===curDir?catColor:'#9CA3AF'}},
+        hoverinfo:'skip', type:'scatter'
+      }})),
+      // Origin
+      {{x:[0],y:[0],mode:'markers',
+        marker:{{size:7,color:'#6B7280',symbol:'cross'}},
+        hoverinfo:'skip',type:'scatter'}},
+      // BCI path
+      {{x: bci_s.map(p=>p[0]), y: bci_s.map(p=>p[1]),
+        mode: 'lines+markers',
+        line:{{color:'#2563EB',width:2.5}},
+        marker:{{size: bci_s.map((_,i)=>i===bci_s.length-1?10:4),
+                 color:'#2563EB'}},
+        hovertemplate:'BCI<br>x: %{{x:.0f}}px<br>y: %{{y:.0f}}px<extra></extra>',
+        type:'scatter'}},
+      // Copilot path
+      {{x: cop_s.map(p=>p[0]), y: cop_s.map(p=>p[1]),
+        mode: 'lines+markers',
+        line:{{color:'#EA580C',width:2.5,dash:'dot'}},
+        marker:{{size: cop_s.map((_,i)=>i===cop_s.length-1?10:4),
+                 color:'#EA580C', symbol:'diamond'}},
+        hovertemplate:'Copilot<br>x: %{{x:.0f}}px<br>y: %{{y:.0f}}px<extra></extra>',
+        type:'scatter'}},
+    ];
+
+    Plotly.react('traj-plot', traces, {{
+      xaxis: axCfg, yaxis: {{...axCfg, scaleanchor:'x', scaleratio:1}},
+      plot_bgcolor:'#F8FAFC', paper_bgcolor:'white',
+      margin:{{t:10,b:10,l:10,r:10}}, showlegend:false,
+      height:520, width:520,
+    }}, {{displayModeBar:false, responsive:false}});
+
+    // Slider
+    const slider = document.getElementById('tick-slider');
+    slider.max   = T;
+    slider.value = tick;
+    document.getElementById('tick-val').textContent = tick;
+
+    // Outcome info
+    const bciOk = (LABELS.indexOf(trial.bci_pred) === curDir);
+    const copOk = (LABELS.indexOf(trial.cop_pred) === curDir);
+    document.getElementById('outcome-info').innerHTML = `
+      <div class="pred-row">
+        <span class="pred-label">BCI predicted:</span>
+        <span class="pred-val ${{bciOk?'ok':'wrong'}}">${{trial.bci_pred}}
+          ${{bciOk?'✓':'✗'}}</span>
+      </div>
+      <div class="pred-row">
+        <span class="pred-label">Copilot predicted:</span>
+        <span class="pred-val ${{copOk?'ok':'wrong'}}">${{trial.cop_pred}}
+          ${{copOk?'✓':'✗'}}</span>
+      </div>
+      <div class="pred-row">
+        <span class="pred-label">Target:</span>
+        <span class="pred-val target">${{LABELS[curDir]}}
+          &nbsp;<i style="font-size:10px;color:#94a3b8;">${{KEYS[curDir]}}</i></span>
+      </div>`;
+  }}
+
+  // ── rebuild everything ─────────────────────────────────────────────────────
+  function rebuild() {{
+    pauseAnim();
+    buildButtons();
+    updateCountNote();
+    updateCatHeader();
+    updateTrialCounter();
+    updatePlot();
+    resetSlider();
+  }}
+
+  function updateCatHeader() {{
+    const meta = CATMETA[curCat];
+    document.getElementById('cat-header').innerHTML =
+      `<span style="color:${{meta.color}};font-weight:700;">${{meta.label}}</span>
+       <span class="cat-desc">&nbsp;—&nbsp;${{meta.desc}}</span>`;
+  }}
+
+  function updateTrialCounter() {{
+    const n = (DATA[curDir][curCat] || []).length;
+    document.getElementById('trial-counter').textContent =
+      n > 0 ? `${{curIdx+1}} / ${{n}}` : '0 / 0';
+    document.getElementById('btn-prev').disabled = (n === 0 || curIdx === 0);
+    document.getElementById('btn-next').disabled = (n === 0 || curIdx >= n-1);
+  }}
+
+  function updateCountNote() {{
+    const c  = COUNTS[curDir];
+    const a  = ACC[curDir];
+    const d  = a.cop - a.bci;
+    const ds = (d>=0?'+':'')+( d*100).toFixed(1)+'pp';
+    const dc = d>=0?'#16a34a':'#dc2626';
+    document.getElementById('count-note').innerHTML = `
+      <b>${{LABELS[curDir]}}</b> &nbsp;
+      BCI ${{(a.bci*100).toFixed(1)}}% → Copilot ${{(a.cop*100).toFixed(1)}}%
+      <span style="color:${{dc}};font-weight:700;">${{ds}}</span><br>
+      <span style="color:#94a3b8;font-size:10px;">
+        ✓ Corrected: ${{c.correction}} &nbsp;|&nbsp;
+        ✗ Failed: ${{c.failure}} &nbsp;|&nbsp;
+        ✗ Both fail: ${{c.both_fail}} &nbsp;|&nbsp;
+        ✓ Both ok: ${{c.both_ok}}
+      </span>`;
+  }}
+
+  function resetSlider() {{
+    const trials = DATA[curDir][curCat] || [];
+    const T = trials.length > 0 ? trials[0].bci.length - 1 : 16;
+    curTick = T;
+    const sl = document.getElementById('tick-slider');
+    sl.max = T; sl.value = T;
+    document.getElementById('tick-val').textContent = T;
+  }}
+
+  // ── navigation ─────────────────────────────────────────────────────────────
+  window.navTrial = function(d) {{
+    const n = (DATA[curDir][curCat] || []).length;
+    curIdx  = Math.max(0, Math.min(n-1, curIdx+d));
+    curTick = (DATA[curDir][curCat][curIdx]?.bci.length ?? 17) - 1;
+    pauseAnim();
+    updateTrialCounter();
+    updatePlot();
+    resetSlider();
+  }};
+
+  window.randTrial = function() {{
+    const n = (DATA[curDir][curCat] || []).length;
+    if (n === 0) return;
+    curIdx  = Math.floor(Math.random() * n);
+    curTick = (DATA[curDir][curCat][curIdx]?.bci.length ?? 17) - 1;
+    pauseAnim();
+    updateTrialCounter();
+    updatePlot();
+    resetSlider();
+  }};
+
+  // ── slider ──────────────────────────────────────────────────────────────────
+  window.onSlider = function(v) {{
+    pauseAnim();
+    curTick = parseInt(v);
+    document.getElementById('tick-val').textContent = v;
+    updatePlot();
+  }};
+
+  // ── animation ──────────────────────────────────────────────────────────────
+  window.playAnim = function() {{
+    pauseAnim();
+    const trials = DATA[curDir][curCat] || [];
+    if (trials.length === 0) return;
+    const T = trials[curIdx].bci.length - 1;
+    if (curTick >= T) curTick = 0;
+    document.getElementById('btn-play').disabled  = true;
+    document.getElementById('btn-pause').disabled = false;
+    animTimer = setInterval(() => {{
+      curTick++;
+      document.getElementById('tick-slider').value = curTick;
+      document.getElementById('tick-val').textContent = curTick;
+      updatePlot();
+      if (curTick >= T) pauseAnim();
+    }}, 180);
+  }};
+
+  window.pauseAnim = function() {{
+    if (animTimer) {{ clearInterval(animTimer); animTimer = null; }}
+    document.getElementById('btn-play').disabled  = false;
+    document.getElementById('btn-pause').disabled = true;
+  }};
+
+  window.resetAnim = function() {{
+    pauseAnim();
+    curTick = 0;
+    document.getElementById('tick-slider').value = 0;
+    document.getElementById('tick-val').textContent = 0;
+    updatePlot();
+  }};
+
+  // ── boot ───────────────────────────────────────────────────────────────────
+  rebuild();
+}})();
+</script>"""
 
 
-# ── assemble final HTML ────────────────────────────────────────────────────────
+# ── assemble HTML ──────────────────────────────────────────────────────────────
 
-def save_html(main_fig, results):
-    main_html = main_fig.to_html(
-        include_plotlyjs='inline', full_html=False,
-        config={'displayModeBar': True, 'scrollZoom': True,
-                'toImageButtonOptions': {'format':'png','filename':'bci_copilot_overview',
-                                         'height':900,'width':1300,'scale':2}},
-    )
-    correction_html = build_correction_section(results)
+def save_html(results):
+    acc_table  = build_accuracy_table(results)
+    explorer   = build_explorer(results)
 
+    # Plotly CDN for the explorer traces (just the JS lib, no figure)
     full = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <title>BCI Copilot Visualization</title>
+<script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
 <style>
-  body {{ font-family: 'Segoe UI', Arial, sans-serif; background: #F8FAFC;
-          margin: 0; padding: 20px; color: #1e293b; }}
-  h1   {{ text-align: center; font-size: 22px; margin: 20px 0 4px; color: #0f172a; }}
-  h2   {{ text-align: center; font-size: 16px; color: #475569; margin: 0 0 16px;
-          font-weight: normal; }}
-  .section-title {{ font-size: 18px; font-weight: bold; margin: 32px 0 12px;
-                    padding-left: 8px; border-left: 4px solid #2563EB; }}
-  .section-sub   {{ font-size: 12px; color: #64748b; margin: -8px 0 16px 12px; }}
-  .ex-grid {{ display: flex; flex-wrap: wrap; gap: 20px; justify-content: center; }}
-  .ex-panel {{ background: white; border: 1px solid #e2e8f0; border-radius: 8px;
-               padding: 12px; width: 400px; box-shadow: 0 1px 3px rgba(0,0,0,0.06); }}
-  .ex-header {{ display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }}
-  .dir-badge {{ background: #1e40af; color: white; font-weight: bold; font-size: 13px;
-                padding: 2px 8px; border-radius: 4px; }}
-  .keys      {{ font-size: 11px; color: #64748b; font-family: monospace; }}
-  .headline  {{ font-size: 12px; font-weight: 600; }}
-  .subline   {{ font-size: 11px; color: #64748b; margin-bottom: 8px; }}
-  .divider   {{ border: none; border-top: 1px solid #e2e8f0; margin: 28px 0; }}
+  *, *::before, *::after {{ box-sizing: border-box; }}
+  body {{
+    font-family: 'Segoe UI', Arial, sans-serif;
+    background: #F8FAFC; margin: 0; padding: 20px 28px;
+    color: #1e293b; max-width: 100%;
+  }}
+  h1 {{ text-align:center; font-size:22px; margin:16px 0 4px; color:#0f172a; }}
+  h2 {{ text-align:center; font-size:13px; color:#64748b; margin:0 0 24px;
+        font-weight:normal; }}
+
+  /* ── section headers ── */
+  .section-title {{
+    font-size:17px; font-weight:700; margin:28px 0 6px;
+    padding-left:10px; border-left:4px solid #2563EB; color:#0f172a;
+  }}
+  .section-sub {{
+    font-size:12px; color:#64748b; margin:0 0 14px 14px;
+  }}
+  .divider {{ border:none; border-top:1px solid #e2e8f0; margin:32px 0; }}
+
+  /* ── accuracy table ── */
+  .acc-table {{
+    width:100%; border-collapse:collapse; font-size:13px;
+    background:white; border-radius:8px;
+    box-shadow:0 1px 4px rgba(0,0,0,0.07); overflow:hidden;
+  }}
+  .acc-table th {{
+    background:#1e40af; color:white; padding:8px 12px;
+    text-align:center; font-weight:600; font-size:12px;
+  }}
+  .acc-table td {{ padding:7px 12px; border-bottom:1px solid #f1f5f9; }}
+  .acc-table tr:last-child td {{ border-bottom:none; }}
+  .acc-table tr:hover {{ background:#f8fafc; }}
+  .acc-table .total-row td {{ background:#eff6ff; border-top:2px solid #bfdbfe; }}
+  .dir-cell {{ white-space:nowrap; }}
+  .dir-badge-sm {{
+    background:#1e40af; color:white; font-weight:700; font-size:11px;
+    padding:2px 7px; border-radius:4px; margin-right:6px;
+  }}
+  .key-sm {{ font-size:11px; color:#64748b; font-family:monospace; }}
+  .num {{ text-align:center; font-variant-numeric:tabular-nums; }}
+  .delta {{ font-weight:700; }}
+  .cat-head {{ font-size:11px; text-align:center; padding:8px 6px; }}
+  .cat-head.corr {{ color:#16a34a; }}
+  .cat-head.fail {{ color:#dc2626; }}
+  .cat-head.bfail {{ color:#9333ea; }}
+  .cat-head.bok   {{ color:#2563EB; }}
+  .cat-count {{ font-size:12px; }}
+  .cat-count.corr  {{ color:#16a34a; font-weight:600; }}
+  .cat-count.fail  {{ color:#dc2626; font-weight:600; }}
+  .cat-count.bfail {{ color:#9333ea; font-weight:600; }}
+  .cat-count.bok   {{ color:#2563EB; font-weight:600; }}
+
+  /* ── explorer ── */
+  #explorer {{ width:100%; }}
+  .ctrl-row {{
+    display:flex; flex-wrap:wrap; gap:20px; align-items:flex-start;
+    margin-bottom:18px;
+  }}
+  .ctrl-group {{ display:flex; flex-direction:column; gap:6px; }}
+  .ctrl-label {{ font-size:11px; font-weight:600; color:#64748b;
+                  text-transform:uppercase; letter-spacing:0.05em; }}
+  .btn-group {{ display:flex; flex-wrap:wrap; gap:6px; }}
+  .sel-btn {{
+    padding:5px 11px; border:1.5px solid #cbd5e1; border-radius:6px;
+    background:white; cursor:pointer; font-size:12px; font-weight:500;
+    color:#475569; transition:all 0.12s;
+  }}
+  .sel-btn:hover:not(:disabled) {{ border-color:#2563EB; color:#2563EB; background:#eff6ff; }}
+  .sel-btn.active {{ background:#1e40af; color:white; border-color:#1e40af; }}
+  .sel-btn:disabled {{ opacity:0.35; cursor:not-allowed; }}
+  .cat-btn.active {{ background: var(--cat-color); border-color: var(--cat-color); }}
+  .cnt {{ font-size:10px; opacity:0.8; }}
+  .nav-group .ctrl-label {{ margin-bottom:2px; }}
+  .nav-row {{ display:flex; align-items:center; gap:6px; }}
+  .nav-btn {{
+    padding:5px 10px; border:1.5px solid #cbd5e1; border-radius:6px;
+    background:white; cursor:pointer; font-size:14px; color:#475569;
+  }}
+  .nav-btn:hover:not(:disabled) {{ border-color:#2563EB; color:#2563EB; }}
+  .nav-btn:disabled {{ opacity:0.3; cursor:not-allowed; }}
+  .trial-counter {{ font-size:13px; font-weight:600; color:#0f172a;
+                    min-width:50px; text-align:center; }}
+
+  .explorer-body {{
+    display:flex; gap:24px; align-items:flex-start; flex-wrap:wrap;
+  }}
+  .info-panel {{
+    flex:1; min-width:260px; display:flex; flex-direction:column; gap:12px;
+  }}
+  .cat-header-box {{
+    font-size:14px; padding:8px 12px; background:white;
+    border-radius:6px; border:1px solid #e2e8f0;
+  }}
+  .cat-desc {{ font-size:12px; color:#64748b; }}
+  .outcome-info {{
+    background:white; border:1px solid #e2e8f0; border-radius:6px;
+    padding:10px 14px; display:flex; flex-direction:column; gap:6px;
+  }}
+  .pred-row {{ display:flex; align-items:center; gap:8px; font-size:13px; }}
+  .pred-label {{ color:#64748b; min-width:130px; }}
+  .pred-val {{ font-weight:700; font-size:14px; }}
+  .pred-val.ok    {{ color:#16a34a; }}
+  .pred-val.wrong {{ color:#dc2626; }}
+  .pred-val.target {{ color:#1e40af; }}
+
+  .playback-box {{
+    background:white; border:1px solid #e2e8f0; border-radius:6px;
+    padding:10px 14px; display:flex; flex-direction:column; gap:10px;
+  }}
+  .tick-row {{ display:flex; align-items:center; gap:8px; }}
+  .tick-label {{ font-size:12px; color:#64748b; white-space:nowrap; }}
+  .tick-val {{ font-size:12px; font-weight:600; min-width:20px; text-align:right; }}
+  .play-row {{ display:flex; gap:8px; }}
+  .play-btn {{
+    padding:5px 12px; border:1.5px solid #cbd5e1; border-radius:6px;
+    background:white; cursor:pointer; font-size:12px; color:#475569;
+    font-weight:500;
+  }}
+  .play-btn:hover:not(:disabled) {{ border-color:#2563EB; color:#2563EB; }}
+  .play-btn:disabled {{ opacity:0.35; cursor:not-allowed; }}
+
+  .legend-box {{
+    display:flex; gap:16px; font-size:12px; color:#475569;
+    padding:6px 0; align-items:center;
+  }}
+  .leg-item {{ display:flex; align-items:center; gap:6px; }}
+  .leg-line {{ display:inline-block; width:28px; height:3px; border-radius:2px; }}
+  .bci-line {{ background:#2563EB; }}
+  .cop-line {{
+    background:repeating-linear-gradient(90deg,#EA580C 0,#EA580C 5px,
+    transparent 5px,transparent 8px);
+    height:3px;
+  }}
+
+  .count-note {{
+    font-size:12px; color:#475569; background:#f8fafc;
+    border:1px solid #e2e8f0; border-radius:6px; padding:8px 12px;
+    line-height:1.8;
+  }}
 </style>
 </head>
 <body>
+
 <h1>BCI Copilot — Cursor Trajectory Visualization</h1>
 <h2>Supervised LSTM Copilot &nbsp;·&nbsp;
     Data: online_arm_trajectories.csv &nbsp;·&nbsp;
-    Overall: BCI 46.7% → Copilot 47.8% (+1.07pp)</h2>
+    7 subjects · 11,760 trials · 8 directions</h2>
 
-<div class="section-title">Overview: all 8 directions</div>
+<div class="section-title">Performance Summary</div>
 <div class="section-sub">
-  Compass layout · 20 individual BCI samples (grey) · Mean BCI (blue) · Mean BCI+Copilot (orange)
-  · Coordinates in pixels (radius = 432)
+  Per-direction accuracy and outcome counts across all 7 subjects.
+  Outcome counts reflect the full dataset (all 1,470 trials per direction).
 </div>
-{main_html}
+{acc_table}
 
 <hr class="divider">
 
-<div class="section-title">Individual trajectory replay</div>
+<div class="section-title">Trajectory Explorer</div>
 <div class="section-sub">
-  Each panel shows a real trial where the BCI decoder alone was wrong (or right)
-  and the copilot changed the outcome. Press ▶ Play to animate tick-by-tick.
-  Use the slider to step through individual ticks.
+  Select a direction and outcome category to browse real trial trajectories.
+  Up to {N_SAMPLE} trials per category are available for replay.
+  Use &#8592; &#8594; to step through trials or &#x21BB; for a random trial.
 </div>
-<div class="ex-grid">
-{correction_html}
-</div>
+{explorer}
 
 </body>
 </html>"""
@@ -762,7 +879,6 @@ def save_html(main_fig, results):
         f.write(full)
     print(f"\n✓ Saved: {OUTPUT_PATH}")
     print("  Double-click to open in browser (self-contained, works offline)")
-    print("  Use the camera icon in the overview toolbar to export PNG for slides")
 
 
 # ── main ───────────────────────────────────────────────────────────────────────
@@ -775,7 +891,7 @@ def main():
     print(f"Data  : {CSV_PATH}")
     print()
 
-    print("Loading supervised LSTM copilot ...")
+    print("Loading supervised LSTM copilot...")
     model = LSTMCopilot()
     model.load_state_dict(torch.load(MODEL_PATH, map_location='cpu'))
     model.eval()
@@ -787,15 +903,12 @@ def main():
     results = compute_all(model, by_dir, by_subj)
     print()
 
-    print("Building overview figure...")
-    main_fig = build_figure(results)
-
-    print("Building correction animations and assembling HTML...")
-    save_html(main_fig, results)
+    print("Assembling HTML...")
+    save_html(results)
 
     print()
     print("=" * 60)
-    print("Per-direction summary (matches evaluate.py cross-trial history):")
+    print("Per-direction summary:")
     print(f"  {'Dir':<4}  {'BCI':>6}  {'Copilot':>8}  {'Delta':>8}")
     print("  " + "-" * 34)
     for lbl in range(8):
