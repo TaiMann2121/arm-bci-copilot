@@ -73,6 +73,21 @@ def angle_pred(cursor):
     if norm < 1e-6: return -1
     return int(np.argmax(LABEL_TO_DIR @ (cursor / norm)))
 
+def angle_error_deg(cursor, target_label):
+    """
+    Absolute angle (degrees) between final cursor vector and true target direction.
+    This is the geometric error regardless of whether the trial was classified
+    correctly. Lower = cursor ended up closer to the target direction.
+    Returns None if cursor didn't move (norm < 1e-6).
+    """
+    norm = np.linalg.norm(cursor)
+    if norm < 1e-6:
+        return None
+    cursor_unit = cursor / norm
+    target_unit = LABEL_TO_DIR[target_label]
+    cos_angle = np.clip(np.dot(cursor_unit, target_unit), -1.0, 1.0)
+    return float(np.degrees(np.arccos(cos_angle)))
+
 
 # ── model ─────────────────────────────────────────────────────────────────────
 
@@ -115,7 +130,8 @@ def load_trials_by_subject(csv_path):
 def simulate_trial(model, trial):
     """
     Simulate one trial. Cursor starts at (0,0). LSTM hidden state resets.
-    Returns (cop_correct, bci_correct).
+    Returns (cop_correct, bci_correct, cop_angle_err, bci_angle_err).
+    Angle errors are in degrees; None if cursor never moved.
     """
     vx_seq, vy_seq = trial['vx'], trial['vy']
     lbl = trial['label']
@@ -147,7 +163,9 @@ def simulate_trial(model, trial):
         cursor_cop = np.clip(cursor_cop + bci_vel + correction, -1.5, 1.5)
         cursor_bci = np.clip(cursor_bci + bci_vel, -1.5, 1.5)
 
-    return angle_pred(cursor_cop) == lbl, angle_pred(cursor_bci) == lbl
+    cop_err = angle_error_deg(cursor_cop, lbl)
+    bci_err = angle_error_deg(cursor_bci, lbl)
+    return angle_pred(cursor_cop) == lbl, angle_pred(cursor_bci) == lbl, cop_err, bci_err
 
 
 # ── main ──────────────────────────────────────────────────────────────────────
@@ -174,7 +192,8 @@ def run_evaluation(model_path):
     print()
 
     results_by_subj = {}
-    results_by_dir  = {i: {'cop':0,'bci':0,'n':0} for i in range(8)}
+    results_by_dir  = {i: {'cop':0,'bci':0,'n':0,
+                           'cop_errs':[], 'bci_errs':[]} for i in range(8)}
 
     print(f"  {'Subject':<10} {'Split':<6} {'BCI':>7}  {'Copilot':>8}  {'Delta':>7}")
     print("  " + "-" * 44)
@@ -182,18 +201,27 @@ def run_evaluation(model_path):
     for subj in subjects:
         trials = by_subj[subj]
         cop_c = bci_c = 0
+        cop_errs_subj = []
+        bci_errs_subj = []
         for trial in trials:
-            cop_ok, bci_ok = simulate_trial(model, trial)
+            cop_ok, bci_ok, cop_err, bci_err = simulate_trial(model, trial)
             if cop_ok: cop_c += 1
             if bci_ok: bci_c += 1
+            if cop_err is not None: cop_errs_subj.append(cop_err)
+            if bci_err is not None: bci_errs_subj.append(bci_err)
             lbl = trial['label']
             results_by_dir[lbl]['cop'] += int(cop_ok)
             results_by_dir[lbl]['bci'] += int(bci_ok)
             results_by_dir[lbl]['n']   += 1
+            if cop_err is not None: results_by_dir[lbl]['cop_errs'].append(cop_err)
+            if bci_err is not None: results_by_dir[lbl]['bci_errs'].append(bci_err)
 
         n = len(trials)
         split = 'train' if subj in TRAIN_SUBJECTS else 'test'
-        results_by_subj[subj] = {'cop':cop_c,'bci':bci_c,'n':n,'split':split}
+        results_by_subj[subj] = {
+            'cop': cop_c, 'bci': bci_c, 'n': n, 'split': split,
+            'cop_errs': cop_errs_subj, 'bci_errs': bci_errs_subj,
+        }
         d = (cop_c - bci_c) / n * 100
         sign = '+' if d >= 0 else ''
         print(f"  {subj:<10} {split:<6} {bci_c/n*100:>6.1f}%  "
@@ -207,9 +235,20 @@ def run_evaluation(model_path):
         tn = sum(r['n']   for r in rs)
         return tc, tb, tn
 
+    def agg_angle(subj_filter=None):
+        rs = results_by_subj.values() if subj_filter is None else \
+             [r for s,r in results_by_subj.items() if r['split']==subj_filter]
+        all_cop = [e for r in rs for e in r['cop_errs']]
+        all_bci = [e for r in rs for e in r['bci_errs']]
+        return np.mean(all_cop), np.mean(all_bci)
+
     all_cop, all_bci, all_n       = agg()
     trn_cop, trn_bci, trn_n       = agg('train')
     tst_cop, tst_bci, tst_n       = agg('test')
+
+    all_cop_ang, all_bci_ang = agg_angle()
+    trn_cop_ang, trn_bci_ang = agg_angle('train')
+    tst_cop_ang, tst_bci_ang = agg_angle('test')
 
     print()
     print("=" * 65)
@@ -230,16 +269,55 @@ def run_evaluation(model_path):
     print("=" * 65)
     print()
 
+    # ── angle error summary ────────────────────────────────────────────────────
+    print("=" * 65)
+    print("ANGLE ERROR (mean absolute degrees from target direction)")
+    print("  Lower is better. 22.5° = boundary between adjacent directions.")
+    print("=" * 65)
+    print(f"OVERALL  ({all_n} trials, all 7 subjects):")
+    print(f"  BCI baseline : {all_bci_ang:.2f}°")
+    print(f"  Copilot      : {all_cop_ang:.2f}°")
+    print(f"  Improvement  : {all_bci_ang - all_cop_ang:+.2f}°")
+    print()
+    print(f"TRAIN subjects (S01-S05):")
+    print(f"  BCI baseline : {trn_bci_ang:.2f}°")
+    print(f"  Copilot      : {trn_cop_ang:.2f}°")
+    print(f"  Improvement  : {trn_bci_ang - trn_cop_ang:+.2f}°")
+    print()
+    print(f"TEST subjects  (S06-S07):")
+    print(f"  BCI baseline : {tst_bci_ang:.2f}°")
+    print(f"  Copilot      : {tst_cop_ang:.2f}°")
+    print(f"  Improvement  : {tst_bci_ang - tst_cop_ang:+.2f}°")
+    print()
+
+    print("Per-subject angle error:")
+    print(f"  {'Subject':<10} {'Split':<6} {'BCI err':>9}  {'Cop err':>9}  {'Delta':>8}")
+    print("  " + "-" * 50)
+    for subj in subjects:
+        r = results_by_subj[subj]
+        b_ang = np.mean(r['bci_errs']) if r['bci_errs'] else float('nan')
+        c_ang = np.mean(r['cop_errs']) if r['cop_errs'] else float('nan')
+        delta = b_ang - c_ang
+        sign = '+' if delta >= 0 else ''
+        print(f"  {subj:<10} {r['split']:<6} {b_ang:>8.2f}°  {c_ang:>8.2f}°  {sign}{delta:>6.2f}°")
+    print("=" * 65)
+    print()
+
     print("Per-direction breakdown (all 7 subjects):")
-    print(f"  {'Dir':<4}  {'BCI':>7}  {'Copilot':>8}  {'Delta':>7}")
-    print("  " + "-" * 34)
+    print(f"  {'Dir':<4}  {'BCI':>7}  {'Copilot':>8}  {'Δacc':>7}  {'BCI err':>9}  {'Cop err':>9}  {'Δerr':>7}")
+    print("  " + "-" * 66)
     for i in range(8):
         r    = results_by_dir[i]
         bpct = r['bci'] / r['n'] * 100
         cpct = r['cop'] / r['n'] * 100
         d    = cpct - bpct
         sign = '+' if d >= 0 else ''
-        print(f"  {LABEL_NAMES[i]:<4}  {bpct:>6.1f}%  {cpct:>7.1f}%  {sign}{d:>5.1f}pp")
+        b_ang = np.mean(r['bci_errs']) if r['bci_errs'] else float('nan')
+        c_ang = np.mean(r['cop_errs']) if r['cop_errs'] else float('nan')
+        ang_d = b_ang - c_ang
+        ang_sign = '+' if ang_d >= 0 else ''
+        print(f"  {LABEL_NAMES[i]:<4}  {bpct:>6.1f}%  {cpct:>7.1f}%  {sign}{d:>5.1f}pp"
+              f"  {b_ang:>8.2f}°  {c_ang:>8.2f}°  {ang_sign}{ang_d:>5.2f}°")
 
     print()
     print("Reference — Run5 (RL chargeTargets, full evaluate.py):")
